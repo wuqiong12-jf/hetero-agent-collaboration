@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.relay/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.log
+artifacts/
+Windows-MCP/
+# Generated native plugin files contain this checkout's absolute paths.
+plugin/relay-native/.mcp.json
+plugin/relay-native/mcp.json
+plugin/relay-native/build-info.json
+plugin/relay-native/plugin.portable.json

@@ -1,0 +1,20 @@
+{
+  "name": "relay-native",
+  "version": "0.4.0",
+  "description": "在桌面原生侧栏和对话侧面板打开 Codex 与 DeepSeek 协作应用。实际入口显示取决于宿主支持。",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "异智能体合作",
+    "shortDescription": "Codex 与 DeepSeek 同屏对话",
+    "longDescription": "声明原生全局侧栏和对话侧面板入口，界面通过 MCP 使用本机协作服务。保留 Codex 宿主原有功能。",
+    "developerName": "本地项目",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#7759AC",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png"
+  }
+}

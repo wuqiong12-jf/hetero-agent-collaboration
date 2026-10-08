@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "relay_native": {
+      "command": "node",
+      "args": ["server.mjs"],
+      "env": { "RELAY_API_BASE": "http://127.0.0.1:4318" },
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 90
+    }
+  }
+}
