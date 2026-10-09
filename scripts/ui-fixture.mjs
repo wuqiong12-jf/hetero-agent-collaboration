@@ -14,7 +14,15 @@ const fixtureProviders = {
   getCapabilities: async () => ({codex:{available:false,detail:'界面验收用演示环境'},harness:{available:false,detail:'界面验收用演示环境'},liveReady:false}),
   runAgent: async () => { throw new Error('UI fixture cannot invoke models'); },
 };
-const engine = new Orchestrator({providers:fixtureProviders,demoDelayMs:1000});
+const engine = new Orchestrator({providers:fixtureProviders,demoDelayMs:1000,workspace:'C:/Projects/hetero-agent-demo'});
+// Optional latency for reproducing close/reopen races in the isolated UI.
+const actionDelay = Number(process.env.RELAY_FIXTURE_ACTION_DELAY_MS || 0);
+if (!Number.isInteger(actionDelay) || actionDelay < 0 || actionDelay > 10000) throw new Error('Invalid fixture action delay');
+const action = engine.action.bind(engine);
+engine.action = async payload => {
+  if (actionDelay && ['saveGoalBrief', 'confirmGoalBrief'].includes(payload?.action)) await new Promise(resolve => setTimeout(resolve, actionDelay));
+  return action(payload);
+};
 const port=Number(process.env.RELAY_FIXTURE_PORT || 4319);
 if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('Invalid fixture port');
 const app = createAppServer({engine,port,modelCatalogProvider:fixtureProviders});

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, Command, ExternalLink, Eye, EyeOff, Folder, History, Loader2, MessageSquarePlus, Pause, Play, Plus, Settings2, Square, Trash2, UsersRound, X } from 'lucide-react';
-import type { Agent, Capabilities, Message, ModelCatalog, Provider, State } from './types';
+import type { Agent, Capabilities, GoalBriefFields, Message, ModelCatalog, Provider, State } from './types';
 import { nativeHost, requestJson, watchState } from './transport';
+import GoalBriefEditor from './GoalBriefEditor';
 
-type Dialog = 'settings' | 'history' | 'workflow' | 'team' | null;
+type Dialog = 'settings' | 'history' | 'workflow' | 'team' | 'goal' | null;
 type AgentForm = { name: string; provider: Provider; modelId: string; role: string; reasoningEffort: string; accessMode: 'read-only' | 'workspace-write'; hidden: boolean };
 type CatalogModel = ModelCatalog['models'][number];
 type Action = (payload: Record<string, unknown>, key?: string) => Promise<boolean>;
@@ -89,7 +90,9 @@ export default function App() {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [pending, setPending] = useState<Record<string, number>>({});
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [draftGoal, setDraftGoal] = useState('');
+  const [goalSeed, setGoalSeed] = useState<{ text: string; sequence: number }>();
+  const goalSequence = useRef(0);
+  const goalSource = useRef<{ key: string; text: string } | undefined>(undefined);
   const [showWorkflow, setShowWorkflow] = useState(false);
   const [adding, setAdding] = useState(false);
   const [split, setSplit] = useState(50);
@@ -140,12 +143,13 @@ export default function App() {
     document.addEventListener('keydown', trap);
     return () => { document.removeEventListener('keydown', trap); old?.focus(); };
   }, [dialog]);
-  const action: Action = async (payload, key = 'global') => {
+  const actionResult = async (payload: Record<string, unknown>, key = 'global'): Promise<State | null> => {
     setPending(old => ({ ...old, [key]: (old[key] || 0) + 1 })); setError('');
-    try { const result = await requestJson<State>('/api/actions', payload); acceptState(result); return true; }
-    catch (err) { setError(err instanceof Error ? err.message : '无法连接服务'); return false; }
+    try { const result = await requestJson<State>('/api/actions', payload); acceptState(result); return result; }
+    catch (err) { setError(err instanceof Error ? err.message : '无法连接服务'); return null; }
     finally { setPending(old => ({ ...old, [key]: Math.max(0, (old[key] || 1) - 1) })); }
   };
+  const action: Action = async (payload, key) => Boolean(await actionResult(payload, key));
   const newChat = async (agentId: string) => { if (await action({ action: 'newChat', agentId }, agentId)) setViews(old => ({ ...old, [agentId]: undefined })); };
   const updateAgent = async (agentId: string, fields: Record<string, unknown>) => {
     const previous = stateRef.current?.chatSessions?.[agentId]?.id;
@@ -195,13 +199,20 @@ export default function App() {
   const accepted = state.tasks.filter(task => task.status === 'accepted').length;
   const errorKey = state.id + ':' + state.revision + ':' + state.error;
   const visibleError = error || (state.error && dismissedError !== errorKey ? state.error : '');
+  const openGoal = (text?: string, source?: { key: string; text: string }) => {
+    setError('');
+    if (text !== undefined) { goalSequence.current += 1; setGoalSeed({ text, sequence: goalSequence.current }); goalSource.current = source; }
+    setDialog('goal');
+    setContext('');
+    requestJson<{ workspace: string }>('/api/context').then(value => setContext(value.workspace || '')).catch(() => setError('无法读取实际工作目录，请连接服务后重试。'));
+  };
   const pane = (agent: Agent) => {
     const conversationId = views[agent.id] || state.chatSessions?.[agent.id]?.id || 'current';
     const key = agent.id + ':' + conversationId;
-    return <ChatPane key={agent.id} agent={agent} state={state} selectedConversation={views[agent.id]} connected={connected} pending={Boolean(pending[agent.id])} showWorkflow={Boolean(cooperating || showWorkflow)} providerReady={agent.provider === 'codex' ? capabilities?.codex.available : capabilities?.harness.available} models={models[agent.provider] || null} embedded={embedded} input={drafts[key] || ''} onInput={text => setDrafts(old => ({ ...old, [key]: text }))} onSent={text => setDrafts(old => old[key] === text ? { ...old, [key]: '' } : old)} onSend={text => action(cooperating && agent.id === state.leaderId ? { action: 'cooperativeGoal', text } : { action: 'message', agentId: agent.id, text }, agent.id)} onNew={() => newChat(agent.id)} onCancel={() => stopAgent(agent)} onHistory={() => { setHistoryAgent(agent.id); setDialog('history'); }} onReturn={() => setViews(old => ({ ...old, [agent.id]: undefined }))} onModel={modelId => updateAgent(agent.id, { modelId, reasoningEffort: 'auto' })} onEffort={reasoningEffort => updateAgent(agent.id, { reasoningEffort })} onSettings={() => setDialog('settings')} />;
+    return <ChatPane key={agent.id} agent={agent} state={state} selectedConversation={views[agent.id]} connected={connected} pending={Boolean(pending[agent.id])} showWorkflow={Boolean(cooperating || showWorkflow)} providerReady={agent.provider === 'codex' ? capabilities?.codex.available : capabilities?.harness.available} models={models[agent.provider] || null} embedded={embedded} input={drafts[key] || ''} onInput={text => setDrafts(old => ({ ...old, [key]: text }))} onSent={text => setDrafts(old => old[key] === text ? { ...old, [key]: '' } : old)} onSend={text => { if (cooperating && agent.id === state.leaderId) { openGoal(text, { key, text: drafts[key] || text }); return Promise.resolve(false); } return action({ action: 'message', agentId: agent.id, text }, agent.id); }} onNew={() => newChat(agent.id)} onCancel={() => stopAgent(agent)} onHistory={() => { setHistoryAgent(agent.id); setDialog('history'); }} onReturn={() => setViews(old => ({ ...old, [agent.id]: undefined }))} onModel={modelId => updateAgent(agent.id, { modelId, reasoningEffort: 'auto' })} onEffort={reasoningEffort => updateAgent(agent.id, { reasoningEffort })} onSettings={() => setDialog('settings')} />;
   };
   const toggleWorkers = () => { if (!visibleWorkers.length) { setDialog('team'); return; } setPanelOpen(open => !open); };
-  const openWorkflow = () => { setDraftGoal(state.goal); setDialog('workflow'); };
+  const openWorkflow = () => setDialog('workflow');
   return <div className={'application-shell ' + (embedded ? 'embedded-shell' : '')}>
     <nav className="app-rail" aria-label="应用功能"><button className={'feature-button ' + (showWorkers ? 'active' : '')} title="显示或隐藏工作者对话" aria-label="显示或隐藏工作者对话" aria-pressed={showWorkers} onClick={toggleWorkers}><UsersRound size={20} /></button></nav>
     <div className={'split-app ' + (embedded ? 'embedded' : '')}>
@@ -216,14 +227,14 @@ export default function App() {
           <button className="icon-button" title="设置" onClick={() => setDialog('settings')}><Settings2 size={16} /></button>
         </div>
       </header>
-      {(cooperating || busyCount > 0) && <div className="cooperation-status"><span>{cooperating ? phaseLabels[state.phase] + ' · ' + leader.name + ' 监工 · ' + accepted + '/' + state.tasks.length + ' 达标' : '独立对话'} · {executionLabel(state)}</span>{cooperating ? state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={12} />暂停</button> : ['paused', 'blocked'].includes(state.phase) ? <button className="button secondary" disabled={anyPending || !state.goal.trim()} onClick={() => action({ action: 'resume' })}><Play size={12} />继续</button> : <button className="button secondary" onClick={openWorkflow}>目标与分工</button> : <button className="button secondary" onClick={() => setDialog('team')}>管理运行</button>}</div>}
+      {(cooperating || busyCount > 0) && <div className="cooperation-status"><span>{cooperating ? phaseLabels[state.phase] + ' · ' + leader.name + ' 监工 · ' + accepted + '/' + state.tasks.length + ' 达标' : '独立对话'} · {executionLabel(state)}</span>{cooperating ? state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={12} />暂停</button> : ['paused', 'blocked'].includes(state.phase) ? <button className="button secondary" disabled={anyPending || !state.goal.trim()} onClick={() => action({ action: 'resume' })}><Play size={12} />继续</button> : <button className="button secondary" onClick={() => openGoal()}>编写任务委托书</button> : <button className="button secondary" onClick={() => setDialog('team')}>管理运行</button>}</div>}
       {visibleError && <div className="error-note" role="alert"><span>{visibleError}</span><button className="icon-button" title="关闭提示" onClick={() => { setError(''); setDismissedError(errorKey); }}><X size={14} /></button></div>}
       <main className={'split-panes ' + (!showWorkers || embedded ? 'single' : '')} ref={panes} style={embedded || !showWorkers ? { display: 'flex' } : { gridTemplateColumns: 'minmax(240px, ' + split + 'fr) 7px minmax(240px, ' + (100 - split) + 'fr)' }}>
         {!embedded && pane(leader)}
         {!embedded && showWorkers && <div className="split-divider" role="separator" aria-label="调整分屏比例" aria-orientation="vertical" aria-valuenow={Math.round(split)} aria-valuemin={28} aria-valuemax={72} tabIndex={0} onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId); document.body.classList.add('resizing'); }} onDoubleClick={() => setSplit(50)} onKeyDown={event => { if (event.key === 'ArrowLeft') { event.preventDefault(); setSplit(value => Math.max(28, value - 3)); } if (event.key === 'ArrowRight') { event.preventDefault(); setSplit(value => Math.min(72, value + 3)); } if (event.key === 'Home') { event.preventDefault(); setSplit(50); } }} />}
         {showWorkers && worker ? <div className="worker-column"><div className="worker-switcher"><label>工作者<select aria-label="选择工作者对话" value={worker.id} onChange={event => setWorkerId(event.target.value)}>{visibleWorkers.map(agent => <option key={agent.id} value={agent.id}>{agent.name + (agentBusy(agent, state) ? ' · 运行中' : '')}</option>)}</select></label><button className="icon-button" title="隐藏工作者聊天；后台继续运行" onClick={() => setPanelOpen(false)}><EyeOff size={14} /></button></div>{pane(worker)}</div> : embedded ? <div className="panel-closed"><p>工作者聊天已隐藏，后台运行状态保持不变。</p><button className="button secondary" onClick={() => visibleWorkers.length ? setPanelOpen(true) : setDialog('team')}>显示工作者</button><button className="button secondary" onClick={() => setDialog('team')}>管理团队与停止任务</button></div> : null}
       </main>
-      {dialog && <div className="modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setDialog(null); }}><section className={'modal ' + (dialog === 'team' ? 'wide' : '')} role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      {dialog && dialog !== 'goal' && <div className="modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setDialog(null); }}><section className={'modal ' + (dialog === 'team' ? 'wide' : '')} role="dialog" aria-modal="true" aria-labelledby="dialog-title">
         <div className="modal-heading"><h2 id="dialog-title">{dialog === 'settings' ? '设置' : dialog === 'history' ? (historyOwner?.name || '智能体') + ' 的对话' : dialog === 'team' ? '智能体团队' : '协作设置'}</h2><button className="icon-button" title="关闭" onClick={() => setDialog(null)}><X size={18} /></button></div>
         <div className="modal-content">
           {error && <div className="error-note" role="alert"><span>{error}</span></div>}
@@ -247,8 +258,7 @@ export default function App() {
             {!archives.length && <p className="context-note">新建对话或切换模型后，原对话会保留在这里。</p>}
           </>}
           {dialog === 'workflow' && <>
-            <p className="context-note">合作模式允许后台分工。仅切换开关不调用模型；提交目标后才开始运行。</p>
-            <label className="workflow-field">目标<textarea aria-label="协作目标" value={draftGoal} onChange={event => setDraftGoal(event.target.value)} /></label>
+            <div className="workflow-current-goal"><strong>{state.activeBrief ? '当前已确认任务 · 版本 ' + state.activeBrief.revision : '已有目标 · 旧版本任务'}</strong><p>{state.activeBrief?.objective || state.goal || '尚无执行目标'}</p><small>编写或保存新草稿不会改动当前工作。新任务须预览确认后才开始。</small><button className="button secondary" type="button" onClick={() => openGoal()}>编写任务委托书</button></div>
             <label className="workflow-field inline">监工<select aria-label="协作监工" value={leader.id} disabled={anyPending} onChange={event => action({ action: 'leader', agentId: event.target.value })}>{state.agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
             <label className="workflow-check"><input type="checkbox" checked={state.settings.autoReview} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoReview: event.target.checked } })} />工作完成后自动核查</label>
             <label className="workflow-check"><input type="checkbox" checked={state.settings.autoDispatch} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoDispatch: event.target.checked } })} />核查后继续分工</label>
@@ -258,11 +268,12 @@ export default function App() {
             <BudgetField label="Codex 自动调用上限" value={state.settings.maxProviderCalls?.codex ?? 12} used={state.usage.autoProviderCalls?.codex ?? 0} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { codex: value } } })} />
             <BudgetField label="DeepSeek 自动调用上限" value={state.settings.maxProviderCalls?.deepseek ?? 16} used={state.usage.autoProviderCalls?.deepseek ?? 0} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { deepseek: value } } })} />
             <p className="context-note">全部实际调用：Codex {state.usage.providerCalls?.codex ?? 0} 次，DeepSeek {state.usage.providerCalls?.deepseek ?? 0} 次。上限限制自动协作，不代表精确订阅额度；手动聊天单独计量。</p>
-            {!cooperating && <p className="context-note">请先在顶栏切换「合作」，再运行目标。</p>}
-            <div className="modal-actions">{state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={14} />暂停协作</button> : <button className="button primary" disabled={anyPending || !draftGoal.trim() || !cooperating} onClick={async () => { if (draftGoal.trim() !== state.goal && !await action({ action: 'goal', text: draftGoal.trim() })) return; setShowWorkflow(true); if (await action({ action: state.phase === 'paused' || state.phase === 'blocked' ? 'resume' : 'start' })) setDialog(null); }}><Play size={14} />运行协作</button>}</div>
+            {!cooperating && <p className="context-note">请先在顶栏切换「合作」，再确认新委托或继续已有工作。</p>}
+            <div className="modal-actions">{state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={14} />暂停协作</button> : ['paused', 'blocked'].includes(state.phase) ? <button className="button primary" disabled={anyPending || !state.goal.trim() || !cooperating} onClick={async () => { if (await action({ action: 'resume' })) setDialog(null); }}><Play size={14} />继续已有任务</button> : <button className="button primary" type="button" onClick={() => openGoal()}>编写新委托</button>}</div>
           </>}
         </div>
       </section></div>}
+      <GoalBriefEditor open={dialog === 'goal'} state={state} leader={leader} workspace={context} pending={anyPending} requestError={error} seed={goalSeed} onClose={() => setDialog(null)} onSave={async (brief: GoalBriefFields, expectedRevision) => { const result = await actionResult({ action: 'saveGoalBrief', brief, expectedRevision }, 'goal'); return result?.goalDraft || null; }} onConfirm={async (revision, expectedMode, expectedLeaderId, expectedLeaderConfig) => { const source = goalSource.current; const result = await actionResult({ action: 'confirmGoalBrief', revision, expectedMode, expectedLeaderId, expectedLeaderConfig }, 'goal'); if (!result) return false; setShowWorkflow(true); if (source && goalSource.current === source) { setDrafts(old => old[source.key] === source.text ? { ...old, [source.key]: '' } : old); goalSource.current = undefined; } return true; }} onReload={async () => { setError(''); try { const result = await requestJson<State>('/api/state'); acceptState(result); return result.goalDraft; } catch (err) { setError(err instanceof Error ? err.message : '无法重新载入保存版'); return null; } }} />
     </div>
   </div>;
 }
@@ -338,6 +349,7 @@ function ChatPane({ agent, state, selectedConversation, connected, pending, show
   const workflowMessageIds = currentWorkflowMessageIds(state);
   const messages = state.messages.filter(message => message.agentId === agent.id && (currentId && message.conversationId === currentId || !archived && showWorkflow && workflowMessageIds.has(message.id)));
   const isLeader = agent.id === state.leaderId;
+  const preparingBrief = state.collaborationMode === 'cooperative' && isLeader;
   const running = agentBusy(agent, state) || state.collaborationMode === 'cooperative' && isLeader && state.phase === 'running';
   const ready = state.mode === 'demo' || Boolean(providerReady);
   const locked = configLocked(agent, state);
@@ -350,7 +362,7 @@ function ChatPane({ agent, state, selectedConversation, connected, pending, show
       {messages.length ? messages.map(message => <ChatMessage key={message.id} message={message} name={agent.name} />) : <div className="chat-empty"><div className="chat-empty-icon"><ProviderIcon provider={agent.provider} /></div><h1>和 {agent.name} 开始对话</h1><p>{embedded ? '宿主对话保持原样，这里是选中的工作者。' : '选择模型与思考程度，直接提问或提交任务。'}</p></div>}
     </div>
     {session?.lastError && !archived && <div className="error-note" role="alert">{session.lastError}</div>}
-    {archived ? <div className="history-notice"><span>正在查看历史对话</span><button className="button secondary" onClick={onReturn}>返回当前对话</button></div> : <div className="chat-composer"><div className="chat-input-wrap"><textarea className="chat-input" aria-label={'发送给 ' + agent.name} placeholder={state.collaborationMode === 'cooperative' && isLeader ? '告诉监工要共同完成的目标…' : '发消息给 ' + agent.name + '…'} value={input} disabled={!connected || !ready} onChange={event => onInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} /><div className="composer-footer"><span className="composer-note">{state.mode === 'demo' ? '演示模式 · 不消耗额度' : !ready ? '尚未连接模型' : running ? '正在处理 · 可停止或预写下一条消息' : 'Enter 发送 · Shift + Enter 换行'}</span>{running ? <button className="stop-button" title={'停止 ' + agent.name + ' 当前工作'} disabled={pending} onClick={onCancel}><Square size={14} fill="currentColor" /></button> : <button className="send-button" title={'发送给 ' + agent.name} disabled={pending || !input.trim() || !connected || !ready} onClick={send}>{pending ? <Loader2 size={16} className="spin" /> : <ArrowUp size={18} />}</button>}</div></div>{state.mode === 'live' && !ready && <button className="connect-prompt" onClick={onSettings}>配置 {providerName(agent.provider)} 连接</button>}</div>}
+    {archived ? <div className="history-notice"><span>正在查看历史对话</span><button className="button secondary" onClick={onReturn}>返回当前对话</button></div> : <div className="chat-composer"><div className="chat-input-wrap"><textarea className="chat-input" aria-label={'发送给 ' + agent.name} placeholder={preparingBrief ? '写下想法，按 Enter 整理任务委托书（不会执行）…' : '发消息给 ' + agent.name + '…'} value={input} disabled={!connected || !ready} onChange={event => onInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} /><div className="composer-footer"><span className="composer-note">{preparingBrief && !running ? 'Enter 整理目标 · 确认后执行' : state.mode === 'demo' ? '演示模式 · 不消耗额度' : !ready ? '尚未连接模型' : running ? '正在处理 · 可停止或预写下一条消息' : 'Enter 发送 · Shift + Enter 换行'}</span>{running ? <button className="stop-button" title={'停止 ' + agent.name + ' 当前工作'} disabled={pending} onClick={onCancel}><Square size={14} fill="currentColor" /></button> : <button className="send-button" title={preparingBrief ? '整理任务目标' : '发送给 ' + agent.name} disabled={pending || !input.trim() || !connected || !ready} onClick={send}>{pending ? <Loader2 size={16} className="spin" /> : <ArrowUp size={18} />}</button>}</div></div>{state.mode === 'live' && !ready && <button className="connect-prompt" onClick={onSettings}>配置 {providerName(agent.provider)} 连接</button>}</div>}
   </section>;
 }
 function ChatMessage({ message, name }: { message: Message; name: string }) {

@@ -60,6 +60,38 @@ test('UI state and explicit user actions go through MCP without model calls',asy
   assert.deepEqual(calls.map(row=>row.path),['/api/context','/api/actions']);
   assert.deepEqual(result.content,[]);
 });
+
+test('goal brief save and confirm actions pass through the private UI transport unchanged',async()=>{
+  const posts=[];
+  const brief={objective:'目标',deliverables:'交付一份报告',acceptance:'结果与证据可核查',constraints:'限定当前工作目录',questions:''};
+  const api=createProtocol({fetcher:async(url,options={})=>{
+    if(url.pathname==='/api/context')return {ok:true,status:200,json:async()=>({workspace:'C:\\work'})};
+    assert.equal(url.pathname,'/api/actions');assert.equal(options.method,'POST');
+    const body=JSON.parse(options.body);posts.push(body);
+    const goalDraft={...brief,revision:1,updatedAt:'2026-10-09T01:00:00Z',...(body.action==='confirmGoalBrief'?{confirmedAt:'2026-10-09T01:01:00Z'}:{})};
+    return {ok:true,status:200,json:async()=>({revision:posts.length,mode:'live',leaderId:'codex-supervisor',goalDraft,
+      ...(body.action==='confirmGoalBrief'?{activeBrief:{...goalDraft,confirmedAt:'2026-10-09T01:01:00Z'}}:{})})};
+  }});
+  const bodies=[{action:'saveGoalBrief',brief,expectedRevision:0},{action:'confirmGoalBrief',revision:1,expectedMode:'live',expectedLeaderId:'codex-supervisor'}];
+  for(const body of bodies){
+    const result=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/actions',method:'POST',body}});
+    assert.equal(result.isError,undefined);assert.equal(result.structuredContent.ok,true);assert.deepEqual(result.content,[]);
+  }
+  assert.deepEqual(posts,bodies);
+  assert.equal(posts.some(body=>['start','review','cooperativeGoal'].includes(body.action)),false);
+});
+
+test('0.5.0 resource registration retains 0.4.0 aliases and uses current inline bundle bytes',async()=>{
+  const api=createProtocol({fetcher:async()=>{throw new Error('resource must not make a service or model request')}});
+  const resources=(await api.handle('resources/list')).resources;
+  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel']);
+  for(const uri of ['ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
+    const result=await api.handle('resources/read',{uri});
+    assert.equal(result.contents[0].uri,uri);
+    assert.ok(result.contents[0].text.includes('window.__RELAY_NATIVE__=true;'));
+    if(uri.endsWith('/panel'))assert.ok(result.contents[0].text.includes("window.__RELAY_VIEW__='deepseek';"));
+  }
+});
 test('native UI bundles code inline and avoids localhost iframes or external scripts',async()=>{
   const api=createProtocol({fetcher:async()=>{throw new Error('no network')}});
   const resource=await api.handle('resources/read',{uri:RESOURCE_URI});
@@ -144,10 +176,10 @@ function finishWorker(state,output='PUBLIC_WORKER_RESULT') {
 }
 const delegation={agentId:'worker',task:'整理实际产物并报告检查',criteria:['产物位置明确','检查结果可验证']};
 
-test('native delegation tools are model-visible at 0.4.0 without exposing arbitrary routes',async()=>{
+test('native delegation tools are model-visible at 0.5.0 without exposing arbitrary routes',async()=>{
   const fixture=teamFixture();
   const init=await fixture.api.handle('initialize');
-  assert.equal(init.serverInfo.version,'0.4.0');
+  assert.equal(init.serverInfo.version,'0.5.0');
   const status=tools.find(tool=>tool.name==='agent_team_status');
   const delegate=tools.find(tool=>tool.name==='delegate_agent_task');
   assert.equal(status.annotations.readOnlyHint,true);

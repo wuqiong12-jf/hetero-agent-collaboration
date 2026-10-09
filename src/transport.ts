@@ -21,7 +21,7 @@ function applyView(view: unknown) {
 
 async function hostApp() {
   if (!application) {
-    application = new McpApp({ name: '异智能体', version: '0.4.0' }, {}, { autoResize: true, strict: true });
+    application = new McpApp({ name: '异智能体', version: '0.5.0' }, {}, { autoResize: true, strict: true });
     application.ontoolinput = params => applyView(params.arguments?.view);
     application.ontoolresult = result => applyView((result.structuredContent as { view?: unknown } | undefined)?.view);
     connecting = application.connect();

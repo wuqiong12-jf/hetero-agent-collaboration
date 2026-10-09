@@ -918,3 +918,172 @@ test('unconfirmed AbortError cleanup persists a workspace barrier across restart
   for (const action of [{ action: 'message', agentId: 'deepseek-builder', text: 'must not bypass barrier' }, { action: 'resume' }, { action: 'cooperativeGoal', text: 'must not bypass barrier' }]) await assert.rejects(restored.action(action), (error) => error.status === 503);
   assert.equal(calls.length, 1);
 });
+
+const completeBrief = (objective = 'CONFIRMED_OBJECTIVE') => ({ objective, deliverables: 'DELIVERY_MARKER', acceptance: 'ACCEPTANCE_MARKER', constraints: 'CONSTRAINT_MARKER', questions: '' });
+function confirmBrief(engine, revision) { const state = engine.getState(); return { action: 'confirmGoalBrief', revision, expectedMode: state.mode, expectedLeaderId: state.leaderId }; }
+
+test('goal drafts cost no calls and do not change an active goal, task, signal, phase, budget, or confirmed snapshot', async (t) => {
+  const initial = createInitialState(); initial.mode = 'live'; initial.goal = 'RUNNING_OLD_TARGET'; initial.tasks = [initial.tasks[0]];
+  initial.goalDraft = { ...completeBrief('OLD_OBJECTIVE'), revision: 1, updatedAt: new Date().toISOString(), confirmedAt: new Date().toISOString() };
+  initial.activeBrief = structuredClone(initial.goalDraft);
+  const calls = [];
+  const engine = workflowEngine({ initialState: initial, providers: { getCapabilities: available, runAgent: (args) => deferredAgent(calls, args) } }); t.after(() => engine.close());
+  await engine.action({ action: 'start' }); await until(engine, () => calls.length === 1);
+  const before = engine.getState();
+  const next = { objective: 'NEXT_DRAFT', deliverables: '', acceptance: '', constraints: '  preserve original whitespace\n', questions: 'Pending design decision' };
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 1, brief: next });
+  const state = engine.getState();
+  assert.equal(calls.length, 1); assert.equal(calls[0].signal.aborted, false);
+  assert.equal(state.phase, before.phase); assert.equal(state.goal, before.goal);
+  assert.deepEqual(state.tasks, before.tasks); assert.deepEqual(state.usage, before.usage); assert.deepEqual(state.activeBrief, before.activeBrief);
+  assert.equal(state.goalDraft.revision, 2); assert.equal(state.goalDraft.confirmedAt, undefined);
+  for (const key of Object.keys(next)) assert.equal(state.goalDraft[key], next[key]);
+});
+
+test('brief DTO, optimistic version, required fields and unresolved questions are rejected without model calls', async (t) => {
+  const engine = workflowEngine({ providers: { getCapabilities: () => assert.fail('invalid confirmation must not probe models'), runAgent: () => assert.fail('draft must not call models') } }); t.after(() => engine.close());
+  await assert.rejects(engine.action({ action: 'saveGoalBrief', brief: completeBrief() }), /expectedRevision/);
+  await assert.rejects(engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: { ...completeBrief(), confirmedAt: 'forged' } }), /五个规定/);
+  await assert.rejects(engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: { ...completeBrief(), objective: 'x'.repeat(3001) } }), /3000/);
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: { objective: 'draft', deliverables: '', acceptance: '', constraints: '', questions: '' } });
+  await assert.rejects(engine.action(confirmBrief(engine, 1)), /目标、交付物和验收标准/);
+  await assert.rejects(engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: completeBrief() }), (error) => error.status === 409);
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 1, brief: { ...completeBrief(), questions: 'Unresolved question' } });
+  await assert.rejects(engine.action(confirmBrief(engine, 2)), /待决定问题/);
+  await assert.rejects(engine.action(confirmBrief(engine, 1)), (error) => error.status === 409);
+  assert.equal(engine.getState().goalDraft.confirmedAt, undefined); assert.equal(engine.getState().activeBrief, undefined);
+  assert.equal(engine.getState().usage.supervisorCalls, 0);
+});
+
+test('confirmation starts exactly once, renders every field into prompts, and later draft edits cannot mutate the active brief', async (t) => {
+  const initial = createInitialState(); initial.mode = 'live'; initial.tasks = [];
+  const calls = []; let capabilityCalls = 0;
+  const engine = workflowEngine({ initialState: initial, providers: { getCapabilities: () => { capabilityCalls += 1; return available(); }, runAgent: (args) => deferredAgent(calls, args) } }); t.after(() => engine.close());
+  const fields = completeBrief();
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: fields });
+  assert.equal(capabilityCalls, 0); assert.equal(calls.length, 0);
+  const payload = confirmBrief(engine, 1);
+  await Promise.all([engine.action(payload), engine.action(payload), engine.action(payload)]);
+  await until(engine, () => calls.length === 1);
+  assert.equal(capabilityCalls, 1); assert.equal(engine.getState().activeBrief.revision, 1); assert.ok(engine.getState().activeBrief.confirmedAt);
+  assert.equal(engine.getState().goalDraft.confirmedAt, engine.getState().activeBrief.confirmedAt);
+  for (const value of Object.values(fields).filter(Boolean)) assert.ok(calls[0].prompt.includes(value));
+  const active = engine.getState().activeBrief; const rendered = engine.getState().goal;
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 1, brief: completeBrief('FUTURE_OBJECTIVE') });
+  assert.deepEqual(engine.getState().activeBrief, active); assert.equal(engine.getState().goal, rendered);
+  await assert.rejects(engine.action(confirmBrief(engine, 2)), /仍有执行|先暂停/);
+  calls[0].resolve({ text: JSON.stringify({ tasks: [newFollowUp({ id: 'brief-delivery' })] }) });
+  await until(engine, () => calls.length === 2);
+  for (const value of Object.values(fields).filter(Boolean)) assert.ok(calls[1].prompt.includes(value));
+  assert.ok(!calls[1].prompt.includes('FUTURE_OBJECTIVE'));
+  calls[1].resolve({ text: 'mock delivered artifact' }); await until(engine, () => calls.length === 3);
+  for (const value of Object.values(fields).filter(Boolean)) assert.ok(calls[2].prompt.includes(value));
+  calls[2].resolve(accepted('c-extra')); await until(engine, (state) => state.phase === 'completed');
+  await engine.action({ action: 'goal', text: 'LEGACY_NEW_TARGET' });
+  assert.equal(engine.getState().activeBrief, undefined); assert.equal(engine.getState().goal, 'LEGACY_NEW_TARGET');
+});
+
+test('confirmation protects preview mode and leader before and after async capability lookup', async (t) => {
+  const fields = completeBrief();
+  const base = workflowEngine(); t.after(() => base.close());
+  await base.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: fields }); const demoPreview = confirmBrief(base, 1);
+  await base.action({ action: 'mode', mode: 'live' });
+  await assert.rejects(base.action(demoPreview), (error) => error.status === 409);
+  assert.equal(base.getState().activeBrief, undefined); assert.equal(base.getState().goalDraft.confirmedAt, undefined);
+  for (const race of ['mode', 'leader']) {
+    const initial = createInitialState(); initial.mode = 'live'; let engine; let calls = 0;
+    const providers = { getCapabilities: async () => { await sleep(1); if (race === 'mode') engine.state.mode = 'demo'; else engine.state.leaderId = 'deepseek-builder'; return available(); }, runAgent: () => { calls += 1; assert.fail('changed preview must not start'); } };
+    engine = workflowEngine({ initialState: initial, providers }); t.after(() => engine.close());
+    await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: fields });
+    await assert.rejects(engine.action(confirmBrief(engine, 1)), (error) => error.status === 409);
+    assert.equal(calls, 0); assert.equal(engine.getState().activeBrief, undefined); assert.equal(engine.getState().goalDraft.confirmedAt, undefined);
+  }
+});
+
+test('ordinary chat and cleanup barriers guard confirmation while preserving an unconfirmed saved draft', async (t) => {
+  const initial = createInitialState(); initial.mode = 'live'; const calls = [];
+  const engine = workflowEngine({ initialState: initial, providers: { getCapabilities: available, runAgent: (args) => deferredAgent(calls, args) } }); t.after(() => engine.close());
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: completeBrief() });
+  await engine.action({ action: 'message', agentId: 'codex-supervisor', text: 'held independent chat' }); await until(engine, () => calls.length === 1);
+  await assert.rejects(engine.action(confirmBrief(engine, 1)), (error) => error.status === 409);
+  assert.equal(calls.length, 1); assert.equal(engine.getState().goalDraft.confirmedAt, undefined);
+  await engine.action({ action: 'cancelChat', agentId: 'codex-supervisor' });
+  await until(engine, (state) => state.executionSummary.retiringReaders === 0 && state.executionSummary.retiringWriters === 0);
+  engine.state.pendingCleanup.push({ runId: 'unconfirmed-fixture', agentId: 'codex-supervisor', kind: 'chat', accessMode: 'workspace-write', reason: 'test' });
+  await assert.rejects(engine.action(confirmBrief(engine, 1)), (error) => error.status === 503);
+  assert.equal(engine.getState().activeBrief, undefined); assert.equal(engine.getState().goalDraft.confirmedAt, undefined);
+});
+
+test('briefs restore durably and completed same-version confirmation is idempotent until raw goals require a new draft version', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'relay-brief-test-')); const persistencePath = join(directory, 'state.json');
+  const engine = workflowEngine({ persistencePath, demoDelayMs: 1 }); let restored;
+  t.after(async () => { await engine.close(); await restored?.close(); rmSync(directory, { recursive: true, force: true }); });
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: completeBrief() });
+  assert.equal(JSON.parse(readFileSync(persistencePath, 'utf8')).goalDraft.revision, 1);
+  await engine.action(confirmBrief(engine, 1)); await until(engine, (state) => state.phase === 'completed');
+  const before = engine.getState(); await engine.action(confirmBrief(engine, 1)); assert.deepEqual(engine.getState().usage, before.usage);
+  await engine.close(); restored = new Orchestrator({ persistencePath, demoDelayMs: 1 });
+  assert.equal(restored.getState().activeBrief.objective, 'CONFIRMED_OBJECTIVE'); assert.equal(restored.getState().goalDraft.revision, 1);
+  await restored.action(confirmBrief(restored, 1)); assert.equal(restored.getState().phase, 'completed');
+  await restored.action({ action: 'goal', text: 'raw changed objective' });
+  await assert.rejects(restored.action(confirmBrief(restored, 1)), (error) => error.status === 409);
+  assert.equal(restored.getState().activeBrief, undefined);
+});
+
+test('draft and confirmation write failures never falsely acknowledge saved confirmation or queue inference', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'relay-brief-test-')); const persistencePath = join(directory, 'state.json');
+  const initial = createInitialState(); initial.mode = 'live'; initial.collaborationMode = 'cooperative'; initial.tasks = [];
+  writeFileSync(persistencePath, JSON.stringify(initial)); let locked = false; const calls = [];
+  const engine = new Orchestrator({ persistencePath, providers: { getCapabilities: available, runAgent: (args) => deferredAgent(calls, args) }, persistenceRetryDelays: [1], fileOps: { rename: async (source, target) => { if (locked) throw Object.assign(new Error('test lock'), { code: 'EPERM' }); await filesystem.rename(source, target); } } });
+  t.after(async () => { locked = false; await engine.close(); rmSync(directory, { recursive: true, force: true }); });
+  await engine.flushPersistence(); locked = true;
+  await assert.rejects(engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: completeBrief() }), (error) => error.status === 503);
+  assert.equal(engine.getState().goalDraft.revision, 1); assert.equal(JSON.parse(readFileSync(persistencePath, 'utf8')).goalDraft, undefined); assert.equal(calls.length, 0);
+  locked = false; await engine.action({ action: 'saveGoalBrief', expectedRevision: 1, brief: completeBrief() });
+  assert.equal(JSON.parse(readFileSync(persistencePath, 'utf8')).goalDraft.revision, 2);
+  const oldGoal = engine.getState().goal; locked = true;
+  await assert.rejects(engine.action(confirmBrief(engine, 2)), (error) => error.status === 503);
+  assert.equal(calls.length, 0); assert.equal(engine.getState().activeBrief, undefined); assert.equal(engine.getState().goalDraft.confirmedAt, undefined); assert.equal(engine.getState().goal, oldGoal);
+  assert.equal(JSON.parse(readFileSync(persistencePath, 'utf8')).activeBrief, undefined);
+  locked = false; await engine.action(confirmBrief(engine, 2)); await until(engine, () => calls.length === 1);
+  const persisted = JSON.parse(readFileSync(persistencePath, 'utf8'));
+  assert.equal(persisted.activeBrief.revision, 2); assert.ok(persisted.goalDraft.confirmedAt);
+});
+
+test('closing during prepared confirmation persistence cannot publish a success or queue a model', async (t) => {
+  const files = new Map(); const persistencePath = join(tmpdir(), `relay-brief-memory-${Date.now()}.json`);
+  let releaseWrite; const blockedWrite = new Promise((resolve) => { releaseWrite = resolve; }); let reachedConfirmation = false;
+  const fileOps = { mkdir: async () => {}, writeFile: async (path, text) => files.set(path, text), unlink: async (path) => files.delete(path), rename: async (source, target) => {
+    if (JSON.parse(files.get(source)).activeBrief && !reachedConfirmation) { reachedConfirmation = true; await blockedWrite; }
+    files.set(target, files.get(source)); files.delete(source);
+  } };
+  let calls = 0;
+  const initial = createInitialState(); initial.mode = 'live'; initial.tasks = [];
+  const engine = workflowEngine({ initialState: initial, persistencePath, fileOps, providers: { getCapabilities: available, runAgent: () => { calls += 1; assert.fail('closing must not infer'); } } });
+  t.after(async () => { releaseWrite(); await engine.close(); });
+  await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: completeBrief() });
+  const attempted = engine.action(confirmBrief(engine, 1));
+  const rejected = assert.rejects(attempted, (error) => error.status === 503);
+  await until(engine, () => reachedConfirmation);
+  const closing = engine.close(); releaseWrite();
+  await rejected; await closing;
+  assert.equal(calls, 0); assert.equal(engine.getState().activeBrief, undefined); assert.equal(engine.getState().goalDraft.confirmedAt, undefined);
+  const persisted = JSON.parse(files.get(persistencePath));
+  assert.equal(persisted.activeBrief, undefined); assert.equal(persisted.goalDraft.confirmedAt, undefined); assert.equal(persisted.goalDraft.revision, 1);
+});
+
+test('same-leader provider, model or reasoning changes cannot consume confirmation inference before or during preflight', async (t) => {
+  for (const [key, value] of [['provider', 'deepseek'], ['modelId', 'new-costly-model'], ['reasoningEffort', 'high']]) {
+    for (const when of ['before', 'during']) {
+      const initial = createInitialState(); initial.mode = 'live'; let engine; let calls = 0;
+      const providers = { getCapabilities: async () => { if (when === 'during') { await sleep(1); engine.state.agents[0][key] = value; } return available(); }, runAgent: () => { calls += 1; assert.fail('changed leader config must not infer'); } };
+      engine = workflowEngine({ initialState: initial, providers }); t.after(() => engine.close());
+      await engine.action({ action: 'saveGoalBrief', expectedRevision: 0, brief: completeBrief() });
+      const leader = engine.getState().agents[0];
+      const payload = { ...confirmBrief(engine, 1), expectedLeaderConfig: { provider: leader.provider, modelId: leader.modelId || 'default', reasoningEffort: leader.reasoningEffort || 'auto' } };
+      if (when === 'before') engine.state.agents[0][key] = value;
+      await assert.rejects(engine.action(payload), (error) => error.status === 409);
+      assert.equal(calls, 0); assert.equal(engine.getState().activeBrief, undefined); assert.equal(engine.getState().goalDraft.confirmedAt, undefined);
+    }
+  }
+});

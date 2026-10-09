@@ -11,6 +11,7 @@ const MAX_TASKS = 12;
 const PROVIDERS = new Set(['codex', 'deepseek']);
 const EFFORTS = new Set(['auto', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const ACCESS_MODES = new Set(['read-only', 'workspace-write']);
+const BRIEF_LIMITS = { objective: 3000, deliverables: 3000, acceptance: 3000, constraints: 2000, questions: 1000 };
 
 export class ActionError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
@@ -188,12 +189,30 @@ export class Orchestrator {
   async _handleAction(payload) {
     if (this.closed) throw new ActionError('协作服务已关闭', 503);
     if (!payload || typeof payload.action !== 'string') throw new ActionError('缺少 action');
-    if (['start', 'resume', 'review', 'retry', 'cooperativeGoal', 'message'].includes(payload.action) && (this.state.pendingCleanup.length || [...this.retiringRuns.values()].some((run) => run.cleanupFailed))) throw new ActionError('无法确认旧模型进程已停止，工作空间锁仍保留；请先由适配器确认相关进程已退出', 503);
-    if (['start', 'resume', 'retry', 'review', 'cooperativeGoal'].includes(payload.action)) this._requireCooperation();
-    if (this.persistenceFailure && (['start', 'resume', 'retry', 'review', 'cooperativeGoal'].includes(payload.action) || (payload.action === 'message' && this.state.mode === 'live'))) {
+    const confirmation = payload.action === 'confirmGoalBrief' ? this._goalConfirmation(payload) : undefined;
+    if (confirmation?.alreadyConfirmed) return this.getState();
+    if (['start', 'resume', 'review', 'retry', 'cooperativeGoal', 'confirmGoalBrief', 'message'].includes(payload.action) && (this.state.pendingCleanup.length || [...this.retiringRuns.values()].some((run) => run.cleanupFailed))) throw new ActionError('无法确认旧模型进程已停止，工作空间锁仍保留；请先由适配器确认相关进程已退出', 503);
+    if (['start', 'resume', 'retry', 'review', 'cooperativeGoal', 'confirmGoalBrief'].includes(payload.action)) this._requireCooperation();
+    if (this.persistenceFailure && (['start', 'resume', 'retry', 'review', 'cooperativeGoal', 'confirmGoalBrief'].includes(payload.action) || (payload.action === 'message' && this.state.mode === 'live'))) {
       if (!await this.flushPersistence({ retry: true })) throw new ActionError(this.persistenceFailure, 503);
     }
     switch (payload.action) {
+      case 'saveGoalBrief': {
+        const current = this.state.goalDraft?.revision ?? 0;
+        if (!Number.isSafeInteger(payload.expectedRevision) || payload.expectedRevision < 0) throw new ActionError('保存草稿必须提供整数 expectedRevision');
+        if (payload.expectedRevision !== current) throw new ActionError('任务委托书已被更新，请先重新读取保存版本', 409);
+        if (current >= Number.MAX_SAFE_INTEGER) throw new ActionError('任务委托书版本已达到上限', 409);
+        const fields = this._briefFields(payload.brief);
+        this.state.goalDraft = { ...fields, revision: current + 1, updatedAt: now() };
+        this._activity('goal-brief-save', `任务委托书草稿 v${current + 1} 已更新；当前工作和调用预算保持不变。`);
+        this._emit();
+        if (!await this.flushPersistence({ retry: true })) throw new ActionError('任务委托书草稿尚未保存到磁盘，请解除文件占用后重试；内存中的草稿已保留', 503);
+        break;
+      }
+      case 'confirmGoalBrief': {
+        await this._beginCooperativeGoal(confirmation.goal, { confirmation: payload, brief: confirmation.draft });
+        break;
+      }
       case 'collaboration': {
         if (!['independent', 'cooperative'].includes(payload.mode)) throw new ActionError('合作模式必须是 independent 或 cooperative');
         if (payload.mode === this.state.collaborationMode) return this.getState();
@@ -207,19 +226,7 @@ export class Orchestrator {
       case 'cooperativeGoal': {
         const goal = truncate(payload.text, 12_000).trim();
         if (!goal) throw new ActionError('合作目标不能为空');
-        if (this.state.phase === 'running' || [...this.runs.values()].some((run) => run.kind !== 'chat')) throw new ActionError('请先暂停当前合作任务，再提交新的合作目标', 409);
-        if (this._workspaceChatBusy()) throw new ActionError('普通聊天仍在生成；请等待完成或停止后，再启动同目录协作', 409);
-        if (this.state.mode === 'live') {
-          await this._requireTeamCapabilities({ planning: true });
-        }
-        this._cancelWorkflowRuns(); this.state.goal = goal; this.state.goalReady = true;
-        this.state.tasks = this.state.mode === 'demo' ? this._demoTasks() : [];
-        this.state.phase = 'running'; delete this.state.error; this.forceDispatch = true;
-        // The goal is visible in the supervisor pane but is not ordinary chat
-        // history: native chat and the background planner have separate contexts.
-        this._message(this.state.leaderId, 'user', 'dispatch', goal, undefined, this.state.chatSessions[this.state.leaderId].id);
-        this._activity('cooperative-goal', `${this._tag()}合作目标已提交，开始规划、派单和验收。`);
-        this._emit(); this._queuePump(); break;
+        await this._beginCooperativeGoal(goal); break;
       }
       case 'start':
       case 'resume': {
@@ -258,6 +265,7 @@ export class Orchestrator {
         const goal = truncate(payload.text, 12_000).trim();
         if (!goal) throw new ActionError('目标不能为空');
         this._cancelRuns(); this.state.goal = goal; this.state.goalReady = true;
+        delete this.state.activeBrief;
         this.state.phase = 'idle'; delete this.state.error;
         this.state.tasks = this.state.mode === 'demo' ? this._demoTasks() : [];
         this._message(this.state.leaderId, 'user', 'message', goal);
@@ -438,6 +446,77 @@ export class Orchestrator {
   }
 
   _tag() { return this.state.mode === 'demo' ? '【演示】' : ''; }
+  _briefFields(brief) {
+    if (!brief || typeof brief !== 'object' || Array.isArray(brief) || Object.keys(brief).some((key) => !(key in BRIEF_LIMITS))) throw new ActionError('任务委托书必须包含五个规定的文本字段');
+    const fields = {};
+    for (const [key, limit] of Object.entries(BRIEF_LIMITS)) {
+      if (!Object.hasOwn(brief, key) || typeof brief[key] !== 'string' || brief[key].length > limit || brief[key].includes('\0')) throw new ActionError(`${key} 必须为不超过 ${limit} 字符的文本`);
+      fields[key] = brief[key];
+    }
+    return fields;
+  }
+  _goalConfirmation(payload) {
+    if (!Number.isSafeInteger(payload.revision) || payload.revision < 1) throw new ActionError('确认必须提供保存的整数 revision');
+    if (!['demo', 'live'].includes(payload.expectedMode) || typeof payload.expectedLeaderId !== 'string' || !payload.expectedLeaderId) throw new ActionError('确认必须包含预览时的 expectedMode 和 expectedLeaderId');
+    if (payload.expectedMode !== this.state.mode || payload.expectedLeaderId !== this.state.leaderId) throw new ActionError('运行模式或负责人已变化，请重新预览任务委托书后确认', 409);
+    if (Object.hasOwn(payload, 'expectedLeaderConfig')) {
+      const expected = payload.expectedLeaderConfig;
+      if (!expected || typeof expected !== 'object' || Array.isArray(expected) || Object.keys(expected).some((key) => !['provider', 'modelId', 'reasoningEffort'].includes(key)) || !PROVIDERS.has(expected.provider) || typeof expected.modelId !== 'string' || !expected.modelId || typeof expected.reasoningEffort !== 'string' || !expected.reasoningEffort) throw new ActionError('expectedLeaderConfig 必须包含提供方、模型 ID 和思考程度');
+      const leader = this._leader();
+      if (expected.provider !== leader.provider || expected.modelId !== (leader.modelId || 'default') || expected.reasoningEffort !== (leader.reasoningEffort || 'auto')) throw new ActionError('负责人渠道、模型或思考程度已变化，请重新预览后确认', 409);
+    }
+    const draft = this.state.goalDraft;
+    if (!draft || draft.revision !== payload.revision) throw new ActionError('任务委托书版本已变化，请重新读取保存版本后确认', 409);
+    if (draft.confirmedAt) {
+      if (this.state.activeBrief?.revision === draft.revision && this.state.activeBrief.confirmedAt) return { alreadyConfirmed: true };
+      throw new ActionError('这个版本已经确认过；请保存为新版本后再发起新任务', 409);
+    }
+    const fields = this._briefFields(Object.fromEntries(Object.keys(BRIEF_LIMITS).map((key) => [key, draft[key]])));
+    for (const key of ['objective', 'deliverables', 'acceptance']) if (!fields[key].trim()) throw new ActionError('确认前必须填写目标、交付物和验收标准');
+    if (fields.questions.trim()) throw new ActionError('请先解决待决定问题并保存新版本，再确认启动');
+    const labels = { objective: '目标', deliverables: '交付物', acceptance: '验收标准', constraints: '约束', questions: '待决定问题' };
+    const goal = `任务委托书（确认版本 ${draft.revision}）\n${Object.entries(labels).map(([key, label]) => `${label}：\n${fields[key]}`).join('\n\n')}`;
+    if (goal.length > 12_256) throw new ActionError('渲染后的任务委托书过长，请精简字段后保存');
+    return { draft: clone(draft), goal, alreadyConfirmed: false };
+  }
+  async _beginCooperativeGoal(goal, { confirmation, brief } = {}) {
+    const check = () => {
+      if (this.closed) throw new ActionError('协作服务已关闭，未启动任务委托书', 503);
+      if (confirmation) {
+        this._goalConfirmation(confirmation);
+        if (this._workspaceRuns().length) throw new ActionError('仍有执行或停止中的任务；请等待完成或停止确认后再启动任务委托书', 409);
+      }
+      if (this.state.phase === 'running' || [...this.runs.values()].some((run) => run.kind !== 'chat')) throw new ActionError('请先暂停当前合作任务，再提交新的合作目标', 409);
+      if (this._workspaceChatBusy()) throw new ActionError('普通聊天仍在生成；请等待完成或停止后，再启动同目录协作', 409);
+    };
+    check();
+    if (this.state.mode === 'live') await this._requireTeamCapabilities({ planning: true });
+    check();
+    if (confirmation) {
+      const confirmedAt = now(); const staged = clone(this.state);
+      staged.activeBrief = { ...clone(brief), confirmedAt };
+      staged.goalDraft = { ...clone(brief), confirmedAt };
+      staged.goal = goal; staged.goalReady = true; staged.tasks = this.state.mode === 'demo' ? this._demoTasks() : [];
+      staged.phase = 'running'; delete staged.error; staged.epoch += 1;
+      staged.updatedAt = now(); staged.revision = Math.max(this.state.revision + 1, Date.now());
+      staged.messages.push({ id: id('message'), agentId: staged.leaderId, role: 'user', kind: 'dispatch', text: goal, at: now(), conversationId: staged.chatSessions[staged.leaderId].id });
+      staged.activity.push({ id: id('activity'), at: now(), type: 'cooperative-goal', text: `${this._tag()}任务委托书 v${brief.revision} 已确认，开始规划、派单和验收。` });
+      // Persist a private prepared snapshot before publishing confirmation or
+      // queuing any model work. Failed writes leave the active goal untouched.
+      this._persist(staged);
+      if (!await this.flushPersistence()) throw new ActionError('任务委托书确认尚未保存，未启动模型；请解除文件占用后重试', 503);
+      if (this.closed) throw new ActionError('协作服务在确认期间关闭，未启动模型；请重新连接并读取保存版本', 503);
+      this.state = staged; this.forceDispatch = true;
+      this._notifyListeners(); this._queuePump(); return;
+    }
+    this._cancelWorkflowRuns(); this.state.goal = goal; this.state.goalReady = true;
+    delete this.state.activeBrief;
+    this.state.tasks = this.state.mode === 'demo' ? this._demoTasks() : [];
+    this.state.phase = 'running'; delete this.state.error; this.forceDispatch = true;
+    this._message(this.state.leaderId, 'user', 'dispatch', goal, undefined, this.state.chatSessions[this.state.leaderId].id);
+    this._activity('cooperative-goal', `${this._tag()}合作目标已提交，开始规划、派单和验收。`);
+    this._emit(); this._queuePump();
+  }
   _assertMessageExpectation(payload) {
     if (Object.hasOwn(payload, 'expectedLeaderId') && (payload.expectedLeaderId !== this.state.leaderId || payload.agentId === this.state.leaderId)) throw new ActionError('委托状态已变化或目标已成为负责人；请重新获取团队状态后再委托', 409);
     if (Object.hasOwn(payload, 'expectedConversationId') && payload.expectedConversationId !== this.state.chatSessions[payload.agentId]?.id) throw new ActionError('目标会话已变化；请重新获取会话状态后再委托', 409);
@@ -600,15 +679,18 @@ export class Orchestrator {
     } else if (this.persistenceFailure) { this.state.phase = 'paused'; this.state.error = this.persistenceFailure; }
   }
   _bumpRevision() { this.state.revision = Math.max((Number.isSafeInteger(this.state.revision) ? this.state.revision : 0) + 1, Date.now()); }
-  _persist() {
+  _persist(snapshot = this.state) {
     if (!this.persistencePath) return;
     // Coalesce intermediate streaming snapshots while one atomic write is in
     // flight. Never delete the last valid destination to work around a lock.
-    this.pendingSnapshot = JSON.stringify(this.state, null, 2);
+    this.pendingSnapshot = JSON.stringify(snapshot, null, 2);
+    this._schedulePersistence();
+  }
+  _schedulePersistence() {
     if (this.persistenceFailure || this.persistenceTask) return;
     this.persistenceTask = this._drainPersistence().finally(() => {
       this.persistenceTask = undefined;
-      if (this.pendingSnapshot !== undefined && !this.persistenceFailure) this._persist();
+      if (this.pendingSnapshot !== undefined && !this.persistenceFailure) this._schedulePersistence();
     });
   }
   async _drainPersistence() {
