@@ -17,12 +17,25 @@ const fixtureProviders = {
 };
 const reviewErrors = Number(process.env.RELAY_FIXTURE_REVIEW_ERRORS || 0);
 if (!Number.isInteger(reviewErrors) || reviewErrors < 0 || reviewErrors > 10) throw new Error('Invalid fixture review errors');
+const recoveryScene = process.env.RELAY_FIXTURE_RECOVERY || '';
+if (recoveryScene && recoveryScene !== 'role-budget') throw new Error('Invalid fixture recovery scene');
+if (recoveryScene && reviewErrors) throw new Error('Recovery and review error scenes cannot be combined');
 const initialState = createInitialState();
 if (reviewErrors) {
   initialState.collaborationMode = 'cooperative';
   initialState.goal = '【演示】核查回复无效时，保留同一交付并只重新核查。';
   initialState.tasks = [{id:'demo-review-retained',title:'核查演示交付',description:'仅用于隔离验收，模拟交付与核查，不生成文件或调用真实模型。',
     agentId:'deepseek-builder',status:'queued',attempt:0,dependsOn:[],criteria:[{id:'demo-evidence',text:'核查原交付的演示证据',status:'pending'}]}];
+  initialState.messages = [];
+}
+if (recoveryScene === 'role-budget') {
+  initialState.collaborationMode = 'cooperative';
+  initialState.goal = '【演示】预算不足后核查已有交付，保留已经通过的步骤。';
+  initialState.settings.maxSupervisorCalls = 1;
+  initialState.tasks = [
+    {id:'demo-recovery-first',title:'整理现有需求',description:'隔离演示第一项交付，无真实模型或文件操作。',agentId:'deepseek-builder',status:'queued',attempt:0,dependsOn:[],criteria:[{id:'demo-first-evidence',text:'提供第一项模拟证据',status:'pending'}]},
+    {id:'demo-recovery-second',title:'核对恢复路径',description:'隔离演示第二项交付，监工预算不足时保留原交付。',agentId:'deepseek-builder',status:'queued',attempt:0,dependsOn:['demo-recovery-first'],criteria:[{id:'demo-second-evidence',text:'提供第二项模拟证据',status:'pending'}]},
+  ];
   initialState.messages = [];
 }
 const engine = new Orchestrator({providers:fixtureProviders,demoDelayMs:1000,workspace:'C:/Projects/hetero-agent-demo',initialState});
@@ -38,6 +51,7 @@ if (reviewErrors) {
   };
   await engine.action({action:'start'});
 }
+if (recoveryScene) await engine.action({action:'start'});
 // Optional latency for reproducing close/reopen races in the isolated UI.
 const actionDelay = Number(process.env.RELAY_FIXTURE_ACTION_DELAY_MS || 0);
 if (!Number.isInteger(actionDelay) || actionDelay < 0 || actionDelay > 10000) throw new Error('Invalid fixture action delay');

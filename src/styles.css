@@ -250,7 +250,38 @@ body.resizing, body.resizing * { cursor: col-resize !important; user-select: non
 .workflow-current-goal strong { color: #8c769d; font-size: 12px; font-weight: 500; }
 .workflow-current-goal p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; color: #6c798d; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
 .workflow-current-goal small { color: #9ea5b3; font-size: 11px; line-height: 1.7; }
+.recovery-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 14px; border: 1px solid #e9e3ef; border-radius: 8px; background: #fcfbfe; }
+.recovery-heading, .recovery-step-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.recovery-heading > strong, .recovery-upcoming > strong { color: #78638c; font-size: 13px; font-weight: 500; }
+.recovery-heading > span, .recovery-step-heading > span { flex-shrink: 0; font-size: 11px; color: #949aad; }
+.recovery-progress { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+.recovery-progress > div { display: flex; flex-direction: column; align-items: center; padding: 7px 3px; border: 1px solid #ebe8f0; border-radius: 6px; background: #fff; }
+.recovery-progress strong { color: #756486; font-size: 17px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.recovery-progress span { color: #979eac; font-size: 10px; white-space: nowrap; }
+.recovery-last { color: #8c789c; font-size: 12px; overflow-wrap: anywhere; }
+.recovery-upcoming { display: flex; flex-direction: column; gap: 9px; }
+.recovery-step { display: flex; flex-direction: column; gap: 6px; padding: 11px; border: 1px solid #e8e6ed; border-radius: 6px; background: #fff; min-width: 0; overflow-wrap: anywhere; }
+.recovery-step-heading > strong { color: #657187; font-size: 12px; font-weight: 500; }
+.recovery-step > p { color: #7f8798; font-size: 12px; }
+.recovery-step > small, .recovery-upcoming > small, .recovery-review-actions > small { color: #979faf; font-size: 11px; }
+.recovery-issue { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; padding: 9px 10px; border: 1px solid #eee4d7; border-radius: 6px; background: #fffcf8; overflow-wrap: anywhere; }
+.recovery-issue > strong { color: #a08a67; font-size: 12px; font-weight: 500; }
+.recovery-issue > p { color: #958974; font-size: 11px; line-height: 1.75; }
+.recovery-issue > small { color: #9e927f; font-size: 11px; }
+.recovery-issue .button { margin-top: 3px; min-height: 27px; padding: 4px 8px; font-size: 11px; }
+.recovery-readiness { color: #8c799d; font-size: 12px; }
+.recovery-review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 4px; }
+.recovery-review-actions > small { flex: 1 1 160px; }
+.recovery-details > summary, .workflow-budget > summary { cursor: pointer; color: #857493; font-size: 12px; }
+.recovery-details > div, .workflow-budget > div { display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
+.workflow-budget { padding: 12px; border: 1px solid #e9e5ef; border-radius: 7px; background: #fcfbfe; }
+.modal-content input:focus-visible { outline: 2px solid #b8a4ca; outline-offset: 3px; }
+.modal-actions > small { flex: 1 1 180px; color: #949ead; font-size: 11px; line-height: 1.7; }
 @media (max-width: 600px) {
+  .recovery-progress { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .recovery-panel { padding: 11px; }
+  .modal-actions { flex-wrap: wrap; }
+  .modal-actions > small { flex-basis: 100%; }
   .goal-context { grid-template-columns: 1fr; gap: 10px; }
   .goal-toolbar > span { flex-basis: 100%; }
   .goal-toolbar .button { flex: 1 1 auto; }

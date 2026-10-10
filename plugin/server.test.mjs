@@ -81,11 +81,11 @@ test('goal brief save and confirm actions pass through the private UI transport 
   assert.equal(posts.some(body=>['start','review','cooperativeGoal'].includes(body.action)),false);
 });
 
-test('0.5.1 resource registration retains 0.5.0 and earlier aliases and uses current inline bundle bytes',async()=>{
+test('0.5.2 resource registration retains 0.5.1 and earlier aliases and uses current inline bundle bytes',async()=>{
   const api=createProtocol({fetcher:async()=>{throw new Error('resource must not make a service or model request')}});
   const resources=(await api.handle('resources/list')).resources;
-  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel']);
-  for(const uri of ['ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
+  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel']);
+  for(const uri of ['ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
     const result=await api.handle('resources/read',{uri});
     assert.equal(result.contents[0].uri,uri);
     assert.ok(result.contents[0].text.includes('window.__RELAY_NATIVE__=true;'));
@@ -176,10 +176,10 @@ function finishWorker(state,output='PUBLIC_WORKER_RESULT') {
 }
 const delegation={agentId:'worker',task:'整理实际产物并报告检查',criteria:['产物位置明确','检查结果可验证']};
 
-test('native delegation tools are model-visible at 0.5.1 without exposing arbitrary routes',async()=>{
+test('native delegation tools are model-visible at 0.5.2 without exposing arbitrary routes',async()=>{
   const fixture=teamFixture();
   const init=await fixture.api.handle('initialize');
-  assert.equal(init.serverInfo.version,'0.5.1');
+  assert.equal(init.serverInfo.version,'0.5.2');
   const status=tools.find(tool=>tool.name==='agent_team_status');
   const delegate=tools.find(tool=>tool.name==='delegate_agent_task');
   assert.equal(status.annotations.readOnlyHint,true);

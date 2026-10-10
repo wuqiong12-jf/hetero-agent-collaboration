@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, Command, ExternalLink, Eye, EyeOff, Folder, History, Loader2, MessageSquarePlus, Pause, Play, Plus, Settings2, Square, Trash2, UsersRound, X } from 'lucide-react';
-import type { Agent, Capabilities, GoalBriefFields, Message, ModelCatalog, Provider, State, Task } from './types';
+import type { Agent, Capabilities, GoalBriefFields, Message, ModelCatalog, Provider, RecoverySettingKey, State, Task } from './types';
 import { nativeHost, requestJson, watchState } from './transport';
 import GoalBriefEditor from './GoalBriefEditor';
+import RecoveryPanel from './RecoveryPanel';
 
 type Dialog = 'settings' | 'history' | 'workflow' | 'team' | 'goal' | null;
 type AgentForm = { name: string; provider: Provider; modelId: string; role: string; reasoningEffort: string; accessMode: 'read-only' | 'workspace-write'; hidden: boolean };
@@ -20,6 +21,11 @@ function reviewDisabledReason(task: Task, state: State, pending: boolean, connec
   if ((task.reviewAttempts ?? 0) >= reviewLimit(state)) return '核查次数已到上限，可调整核查额外调用上限后继续。';
   if (!connected) return '等待服务重新连接。';
   if (pending) return '请求处理中，请等待完成。';
+  const recovery = state.recovery?.summary;
+  if (!recovery) return '恢复信息待同步，暂不能确认核查条件。';
+  const hardIssues = new Set(['service-closed', 'cleanup-unconfirmed', 'stopping', 'active-execution', 'chat-busy', 'persistence-failed', 'cooperation-disabled', 'goal-empty']);
+  const blockingIssue = recovery.globalIssues.find(issue => hardIssues.has(issue.code));
+  if (blockingIssue) return blockingIssue.detail;
   const monitor = state.agents.find(agent => agent.id === state.leaderId);
   if (!monitor || agentBusy(monitor, state)) return '监工正在处理工作，请等待完成或停止后再核查。';
   if (Object.values(state.chatSessions || {}).some(session => session.status === 'running')) return '普通聊天仍在生成，请等待完成或停止后再核查。';
@@ -112,6 +118,8 @@ export default function App() {
   const goalSequence = useRef(0);
   const goalSource = useRef<{ key: string; text: string } | undefined>(undefined);
   const [showWorkflow, setShowWorkflow] = useState(false);
+  const [budgetOpen, setBudgetOpen] = useState(false);
+  const [settingFocus, setSettingFocus] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [split, setSplit] = useState(50);
   const panes = useRef<HTMLDivElement>(null);
@@ -161,6 +169,13 @@ export default function App() {
     document.addEventListener('keydown', trap);
     return () => { document.removeEventListener('keydown', trap); old?.focus(); };
   }, [dialog]);
+  useEffect(() => {
+    if (dialog !== 'workflow' || !settingFocus) return;
+    const input = document.getElementById('workflow-setting-' + settingFocus);
+    input?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    input?.focus({ preventScroll: true });
+    setSettingFocus(null);
+  }, [dialog, budgetOpen, settingFocus]);
   const actionResult = async (payload: Record<string, unknown>, key = 'global'): Promise<State | null> => {
     setPending(old => ({ ...old, [key]: (old[key] || 0) + 1 })); setError('');
     try { const result = await requestJson<State>('/api/actions', payload); acceptState(result); return result; }
@@ -241,6 +256,10 @@ export default function App() {
   };
   const toggleWorkers = () => { if (!visibleWorkers.length) { setDialog('team'); return; } setPanelOpen(open => !open); };
   const openWorkflow = () => setDialog('workflow');
+  const focusRecoverySetting = (key: RecoverySettingKey | 'autoReview') => { if (key !== 'autoReview') setBudgetOpen(true); setSettingFocus(key); };
+  const recovery = state.recovery?.summary;
+  const resumeReason = !connected ? '等待本地服务重新连接。' : !recovery ? '恢复信息待同步，暂不能确认继续条件。' : !recovery.resume.allowed ? '请先处理恢复与进度中的提示。' : anyPending ? '请求处理中，请等待完成。' : '';
+  const channelReason = recovery?.resume.needsCapabilityCheck ? '继续时会重新验证实际需要的模型渠道；验证未通过时不启动新的执行，并显示原因。' : '';
   return <div className={'application-shell ' + (embedded ? 'embedded-shell' : '')}>
     <nav className="app-rail" aria-label="应用功能"><button className={'feature-button ' + (showWorkers ? 'active' : '')} title="显示或隐藏工作者对话" aria-label="显示或隐藏工作者对话" aria-pressed={showWorkers} onClick={toggleWorkers}><UsersRound size={20} /></button></nav>
     <div className={'split-app ' + (embedded ? 'embedded' : '')}>
@@ -255,7 +274,7 @@ export default function App() {
           <button className="icon-button" title="设置" onClick={() => setDialog('settings')}><Settings2 size={16} /></button>
         </div>
       </header>
-      {(cooperating || busyCount > 0 || pendingReviews > 0) && <div className="cooperation-status"><span>{cooperating ? phaseLabels[state.phase] + ' · ' + leader.name + ' 监工 · ' + accepted + '/' + state.tasks.length + ' 达标' : '独立对话'} · {executionLabel(state)}</span><div className="cooperation-actions">{pendingReviews > 0 && <button className="button secondary" onClick={openWorkflow}>{pendingReviews} 项待重新核查</button>}{cooperating ? state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={12} />暂停</button> : ['paused', 'blocked'].includes(state.phase) ? <button className="button secondary" disabled={anyPending || !state.goal.trim()} onClick={() => action({ action: 'resume' })}><Play size={12} />继续</button> : <button className="button secondary" onClick={() => openGoal()}>编写任务委托书</button> : <button className="button secondary" onClick={() => setDialog('team')}>管理运行</button>}</div></div>}
+      {(cooperating || busyCount > 0 || pendingReviews > 0) && <div className="cooperation-status"><span>{cooperating ? phaseLabels[state.phase] + ' · ' + leader.name + ' 监工 · ' + accepted + '/' + state.tasks.length + ' 达标' : '独立对话'} · {executionLabel(state)}</span><div className="cooperation-actions">{pendingReviews > 0 && <button className="button secondary" onClick={openWorkflow}>{pendingReviews} 项待重新核查</button>}{cooperating ? state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={12} />暂停</button> : ['paused', 'blocked'].includes(state.phase) ? <button className="button secondary" onClick={openWorkflow}>恢复与进度</button> : <button className="button secondary" onClick={() => openGoal()}>编写任务委托书</button> : <button className="button secondary" onClick={() => setDialog('team')}>管理运行</button>}</div></div>}
       {visibleError && <div className="error-note" role="alert"><span>{visibleError}</span><button className="icon-button" title="关闭提示" onClick={() => { setError(''); setDismissedError(errorKey); }}><X size={14} /></button></div>}
       <main className={'split-panes ' + (!showWorkers || embedded ? 'single' : '')} ref={panes} style={embedded || !showWorkers ? { display: 'flex' } : { gridTemplateColumns: 'minmax(240px, ' + split + 'fr) 7px minmax(240px, ' + (100 - split) + 'fr)' }}>
         {!embedded && pane(leader)}
@@ -263,7 +282,7 @@ export default function App() {
         {showWorkers && worker ? <div className="worker-column"><div className="worker-switcher"><label>工作者<select aria-label="选择工作者对话" value={worker.id} onChange={event => setWorkerId(event.target.value)}>{visibleWorkers.map(agent => <option key={agent.id} value={agent.id}>{agent.name + (agentBusy(agent, state) ? ' · 运行中' : '')}</option>)}</select></label><button className="icon-button" title="隐藏工作者聊天；后台继续运行" onClick={() => setPanelOpen(false)}><EyeOff size={14} /></button></div>{pane(worker)}</div> : embedded ? <div className="panel-closed"><p>工作者聊天已隐藏，后台运行状态保持不变。</p><button className="button secondary" onClick={() => visibleWorkers.length ? setPanelOpen(true) : setDialog('team')}>显示工作者</button><button className="button secondary" onClick={() => setDialog('team')}>管理团队与停止任务</button></div> : null}
       </main>
       {dialog && dialog !== 'goal' && <div className="modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setDialog(null); }}><section className={'modal ' + (dialog === 'team' ? 'wide' : '')} role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-        <div className="modal-heading"><h2 id="dialog-title">{dialog === 'settings' ? '设置' : dialog === 'history' ? (historyOwner?.name || '智能体') + ' 的对话' : dialog === 'team' ? '智能体团队' : '协作设置'}</h2><button className="icon-button" title="关闭" onClick={() => setDialog(null)}><X size={18} /></button></div>
+        <div className="modal-heading"><h2 id="dialog-title">{dialog === 'settings' ? '设置' : dialog === 'history' ? (historyOwner?.name || '智能体') + ' 的对话' : dialog === 'team' ? '智能体团队' : '恢复与进度'}</h2><button className="icon-button" title="关闭" onClick={() => setDialog(null)}><X size={18} /></button></div>
         <div className="modal-content">
           {error && <div className="error-note" role="alert"><span>{error}</span></div>}
           {dialog === 'team' && <>
@@ -286,21 +305,28 @@ export default function App() {
             {!archives.length && <p className="context-note">新建对话或切换模型后，原对话会保留在这里。</p>}
           </>}
           {dialog === 'workflow' && <>
+            <RecoveryPanel state={state} pending={anyPending} connected={connected} channelReason={channelReason} reviewReason={taskId => { const task = state.tasks.find(item => item.id === taskId); return task ? reviewDisabledReason(task, state, anyPending, connected) : '任务信息待同步。'; }} onReview={reviewAgain} onSetting={focusRecoverySetting} onRetrySave={() => action({ action: 'retrySave' }, 'retrySave')} onGoal={() => openGoal()} onTeam={() => setDialog('team')} onCooperation={() => action({ action: 'collaboration', mode: 'cooperative' })} />
             {reviewProblems.length > 0 && <section className="review-problems" aria-label="核查待处理任务"><strong>核查未形成有效结论</strong><p className="context-note">现有交付等待核查。仅重新核查会继续检查同一份输出。</p>{reviewProblems.map(task => { const reason = reviewDisabledReason(task, state, anyPending, connected); return <article className="review-problem" key={task.id}><strong>{task.title}</strong><small>当前工作者尝试 {task.attempt} · 已启动核查 {task.reviewAttempts ?? 0}/{reviewLimit(state)} 次</small><p>{task.reviewError}</p><div className="review-problem-actions"><button className="button secondary" type="button" aria-label={'仅重新核查：' + task.title} disabled={Boolean(reason)} title={reason || '继续核查当前交付'} onClick={() => reviewAgain(task.id)}>{pending['review:' + task.id] ? <Loader2 size={12} className="spin" /> : <Check size={12} />}仅重新核查</button>{reason && <small>{reason}</small>}</div></article>; })}</section>}
             <div className="workflow-current-goal"><strong>{state.activeBrief ? '当前已确认任务 · 版本 ' + state.activeBrief.revision : '已有目标 · 旧版本任务'}</strong><p>{state.activeBrief?.objective || state.goal || '尚无执行目标'}</p><small>编写或保存新草稿不会改动当前工作。新任务须预览确认后才开始。</small><button className="button secondary" type="button" onClick={() => openGoal()}>编写任务委托书</button></div>
             <label className="workflow-field inline">监工<select aria-label="协作监工" value={leader.id} disabled={anyPending} onChange={event => action({ action: 'leader', agentId: event.target.value })}>{state.agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
-            <label className="workflow-check"><input type="checkbox" checked={state.settings.autoReview} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoReview: event.target.checked } })} />工作完成后自动核查</label>
+            <label className="workflow-check"><input id="workflow-setting-autoReview" type="checkbox" checked={state.settings.autoReview} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoReview: event.target.checked } })} />工作完成后自动核查</label>
             <label className="workflow-check"><input type="checkbox" checked={state.settings.autoDispatch} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoDispatch: event.target.checked } })} />核查后继续分工</label>
             <label className="workflow-check"><input type="checkbox" checked={showWorkflow} onChange={event => setShowWorkflow(event.target.checked)} />在对话中显示本次协作输出</label>
-            <BudgetField label="核查额外调用上限" value={state.settings.maxReviewRetries ?? 1} min={0} max={10} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxReviewRetries: value } })} />
-            <p className="context-note">每次工作者交付最多核查 {reviewLimit(state)} 次，包含首次核查和额外调用。已启动次数包含取消与监工交接；暂停、继续或换监工会保留次数。核查沿用监工及提供方自动调用预算。</p>
             <BudgetField label="同时只读智能体上限" value={state.settings.maxParallelReaders ?? 3} max={4} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxParallelReaders: value } })} />
             <p className="context-note">最多同时运行 1–4 个只读执行，独立聊天与合作任务共享此限额。写入执行独占目录；当前 {executionLabel(state)}。</p>
-            <BudgetField label="Codex 自动调用上限" value={state.settings.maxProviderCalls?.codex ?? 12} used={state.usage.autoProviderCalls?.codex ?? 0} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { codex: value } } })} />
-            <BudgetField label="DeepSeek 自动调用上限" value={state.settings.maxProviderCalls?.deepseek ?? 16} used={state.usage.autoProviderCalls?.deepseek ?? 0} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { deepseek: value } } })} />
-            <p className="context-note">{state.mode === 'demo' ? '演示调用计数' : '全部实际调用'}：Codex {state.usage.providerCalls?.codex ?? 0} 次，DeepSeek {state.usage.providerCalls?.deepseek ?? 0} 次。上限限制自动协作，不代表精确订阅额度；手动聊天单独计量。</p>
+            <details className="workflow-budget" open={budgetOpen} onToggle={event => setBudgetOpen(event.currentTarget.open)}><summary>预算与返工上限</summary><div>
+              <BudgetField id="workflow-setting-maxSupervisorCalls" label="监工自动调用上限" value={state.settings.maxSupervisorCalls} used={state.usage.autoSupervisorCalls ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxSupervisorCalls: value } })} />
+              <BudgetField id="workflow-setting-maxWorkerCalls" label="工作者自动调用上限" value={state.settings.maxWorkerCalls} used={state.usage.autoWorkerCalls ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxWorkerCalls: value } })} />
+              <BudgetField id="workflow-setting-maxRetries" label="工作者额外返工上限" value={state.settings.maxRetries} min={0} max={20} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxRetries: value } })} />
+              <p className="context-note">此上限限制交付被判未达标后的返工。每次启动都计入工作者总调用预算，中断后重新执行也不会返还已用调用。</p>
+              <BudgetField id="workflow-setting-maxReviewRetries" label="核查额外调用上限" value={state.settings.maxReviewRetries ?? 1} min={0} max={10} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxReviewRetries: value } })} />
+              <p className="context-note">每次工作者交付最多核查 {reviewLimit(state)} 次，包含首次核查和额外调用。已启动次数包含取消与监工交接；暂停、继续或换监工会保留次数。核查沿用监工及提供方自动调用预算。</p>
+              <BudgetField id="workflow-setting-maxProviderCalls.codex" label="Codex 自动调用上限" value={state.settings.maxProviderCalls?.codex ?? 12} used={state.usage.autoProviderCalls?.codex ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { codex: value } } })} />
+              <BudgetField id="workflow-setting-maxProviderCalls.deepseek" label="DeepSeek 自动调用上限" value={state.settings.maxProviderCalls?.deepseek ?? 16} used={state.usage.autoProviderCalls?.deepseek ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { deepseek: value } } })} />
+              <p className="context-note">{state.mode === 'demo' ? '演示调用计数' : '全部实际调用'}：监工 {state.usage.supervisorCalls} 次，工作者 {state.usage.workerCalls} 次；Codex {state.usage.providerCalls?.codex ?? 0} 次，DeepSeek {state.usage.providerCalls?.deepseek ?? 0} 次。上限限制自动协作，不代表精确订阅额度；手动聊天单独计量。调整上限会保留已用计数。</p>
+            </div></details>
             {!cooperating && <p className="context-note">请先在顶栏切换「合作」，再确认新委托或继续已有工作。</p>}
-            <div className="modal-actions">{state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={14} />暂停协作</button> : ['paused', 'blocked'].includes(state.phase) ? <button className="button primary" disabled={anyPending || !state.goal.trim() || !cooperating} onClick={async () => { if (await action({ action: 'resume' })) setDialog(null); }}><Play size={14} />继续已有任务</button> : <button className="button primary" type="button" onClick={() => openGoal()}>编写新委托</button>}</div>
+            <div className="modal-actions">{state.phase === 'running' ? <button className="button secondary" disabled={anyPending} onClick={() => action({ action: 'pause' })}><Pause size={14} />暂停协作</button> : ['paused', 'blocked'].includes(state.phase) ? <><small>{resumeReason || channelReason}</small><button className="button primary" disabled={Boolean(resumeReason)} title={resumeReason || '按当前任务状态继续'} onClick={async () => { if (await action({ action: 'resume' })) setDialog(null); }}><Play size={14} />继续已有任务</button></> : <button className="button primary" type="button" onClick={() => openGoal()}>编写新委托</button>}</div>
           </>}
         </div>
       </section></div>}
@@ -364,10 +390,10 @@ function NewAgentEditor({ catalog, count, pending, onAdd, onCancel }: { catalog:
     <div className="agent-editor-actions"><label className="workflow-check"><input type="checkbox" checked={form.hidden} disabled={pending} onChange={event => edit({ hidden: event.target.checked })} />加入后隐藏聊天</label><button className="button secondary" type="button" disabled={pending} onClick={onCancel}>取消</button><button className="button primary" type="submit" disabled={pending || count >= 8 || !form.name.trim()}>加入团队</button></div>
   </form>;
 }
-function BudgetField({ label, value, used, min = 1, max = 100, disabled, onSave }: { label: string; value: number; used?: number; min?: number; max?: number; disabled: boolean; onSave: (value: number) => Promise<boolean> }) {
+function BudgetField({ id, label, value, used, min = 1, max = 100, disabled, onSave }: { id?: string; label: string; value: number; used?: number; min?: number; max?: number; disabled: boolean; onSave: (value: number) => Promise<boolean> }) {
   const [draft, setDraft] = useState(String(value));
   useEffect(() => setDraft(String(value)), [value]);
-  return <label className="workflow-field inline">{label}<input type="number" aria-label={label} min={min} max={max} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} onBlur={async () => { const number = Number(draft); if (!draft.trim() || !Number.isInteger(number) || number < min || number > max) { setDraft(String(value)); return; } if (number !== value && !await onSave(number)) setDraft(String(value)); }} />{used !== undefined && <small>自动已用 {used} 次</small>}</label>;
+  return <label className="workflow-field inline">{label}<input id={id} type="number" aria-label={label} min={min} max={max} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} onBlur={async () => { const number = Number(draft); if (!draft.trim() || !Number.isInteger(number) || number < min || number > max) { setDraft(String(value)); return; } if (number !== value && !await onSave(number)) setDraft(String(value)); }} />{used !== undefined && <small>自动已用 {used} 次</small>}</label>;
 }
 
 type ChatPaneProps = { agent: Agent; state: State; selectedConversation?: string; connected: boolean; pending: boolean; showWorkflow: boolean; providerReady?: boolean; models: ModelCatalog | null; embedded: boolean; input: string; onInput: (text: string) => void; onSent: (text: string) => void; onSend: (text: string) => Promise<boolean>; onNew: () => void; onCancel: () => void; onHistory: () => void; onReturn: () => void; onModel: (model: string) => void; onEffort: (effort: string) => void; onSettings: () => void };

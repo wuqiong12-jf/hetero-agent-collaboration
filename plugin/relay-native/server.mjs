@@ -7,8 +7,8 @@ import { readFileSync } from 'node:fs';
 
 const pluginRoot = dirname(fileURLToPath(import.meta.url));
 const icon = {src:'data:image/png;base64,'+readFileSync(join(pluginRoot,'assets','icon.png')).toString('base64'),mimeType:'image/png',sizes:['256x256']};
-export const RESOURCE_URI = 'ui://relay/v0.5.1/workspace';
-export const PANEL_URI = 'ui://relay/v0.5.1/panel';
+export const RESOURCE_URI = 'ui://relay/v0.5.2/workspace';
+export const PANEL_URI = 'ui://relay/v0.5.2/panel';
 export const RESOURCE_MIME = 'text/html;profile=mcp-app';
 const versions = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
 const emptyInput = { type: 'object', properties: {}, additionalProperties: false };
@@ -355,14 +355,14 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
       if (method === 'initialize') return {
         protocolVersion: versions.has(params.protocolVersion) ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: {listChanged:true}, resources: { subscribe: false, listChanged: true }, extensions: { 'io.modelcontextprotocol/ui': {} } },
-        serverInfo: { name: 'relay-native', title: '异智能体合作', version: '0.5.1', icons: [icon] },
+        serverInfo: { name: 'relay-native', title: '异智能体合作', version: '0.5.2', icons: [icon] },
       };
       if (method === 'ping') return {};
       if (method === 'tools/list') return { tools };
       if (method === 'resources/list') return { resources: [resource,{...resource,uri:PANEL_URI,name:'relay-panel',title:'异智能体'}] };
       if (method === 'resources/templates/list') return { resourceTemplates: [] };
       if (method === 'resources/read') {
-        if (![RESOURCE_URI,PANEL_URI,'ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel','ui://relay/v0.3.0/workspace','ui://relay/v0.3.0/panel','ui://relay/v0.2.4/workspace','ui://relay/v0.2.4/panel','ui://relay/v0.2.3/workspace','ui://relay/v0.2.3/panel','ui://relay/v0.2.2/workspace','ui://relay/v0.2.2/panel','ui://relay/workspace','ui://relay/panel'].includes(params.uri)) throw rpcError('UI 资源不存在。');
+        if (![RESOURCE_URI,PANEL_URI,'ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel','ui://relay/v0.3.0/workspace','ui://relay/v0.3.0/panel','ui://relay/v0.2.4/workspace','ui://relay/v0.2.4/panel','ui://relay/v0.2.3/workspace','ui://relay/v0.2.3/panel','ui://relay/v0.2.2/workspace','ui://relay/v0.2.2/panel','ui://relay/workspace','ui://relay/panel'].includes(params.uri)) throw rpcError('UI 资源不存在。');
         let html=await inlineBundle(distRoot);
         if(params.uri===PANEL_URI || params.uri.endsWith('/panel')) html=html.replace('window.__RELAY_NATIVE__=true;',"window.__RELAY_NATIVE__=true;window.__RELAY_VIEW__='deepseek';");
         return { contents: [{

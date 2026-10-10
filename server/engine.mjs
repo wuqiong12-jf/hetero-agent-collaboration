@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, copyFileSync, promises as filesystem } from 'node:fs';
 import { dirname } from 'node:path';
+import { describeRecovery } from './recovery.mjs';
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}-${randomUUID()}`;
@@ -178,7 +179,21 @@ export class Orchestrator {
     this._persist();
   }
 
-  getState() { return clone(this.state); }
+  getState() {
+    const snapshot = clone(this.state);
+    const taskActors = Object.fromEntries(this.state.tasks.filter(task => ['queued', 'rejected'].includes(task.status)).map(task => {
+      const actor = this._taskActor(task);
+      return [task.id, actor ? { id: actor.id, name: actor.name, provider: actor.provider, accessMode: actor.accessMode, status: actor.status } : undefined];
+    }));
+    snapshot.recovery = { summary: describeRecovery(snapshot, {
+      closed: this.closed, persistenceFailed: Boolean(this.persistenceFailure),
+      cleanupUnconfirmed: this.state.pendingCleanup.length > 0 || [...this.retiringRuns.values()].some(run => run.cleanupFailed),
+      stoppingCount: [...this.retiringRuns.values()].filter(run => !run.cleanupFailed).length,
+      activeCount: [...this.runs.values()].filter(run => run.kind !== 'chat').length,
+      chatBusy: this._workspaceChatBusy(), taskActors, workerCount: this._workerAgents().length,
+    }) };
+    return snapshot;
+  }
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   async getCapabilities() { return this.providers.getCapabilities(); }
 
@@ -250,6 +265,11 @@ export class Orchestrator {
         this._cancelWorkflowRuns(); this.state.phase = 'paused';
         this._activity('pause', '协作已暂停。保留已有输出；待执行任务和待验收结果可继续。');
         this._emit(); break;
+      }
+      case 'retrySave': {
+        if (!await this.flushPersistence({ retry: true })) throw new ActionError('状态仍未保存，请先检查文件占用与目录权限。没有启动模型任务。', 503);
+        this._enforceBlockingState();
+        break;
       }
       case 'reset': {
         this._cancelRuns();
@@ -328,13 +348,28 @@ export class Orchestrator {
       }
       case 'review': {
         const task = this._task(payload.taskId);
-        if (task.status === 'accepted') return this.getState();
-        if (task.status !== 'reviewing') throw new ActionError('只有已完成输出、等待核查的任务可以验收', 409);
-        if (this.reviewLocks.has(task.id)) return this.getState();
-        if (this._reviewExhausted(task)) { const reason = this._reviewLimitMessage(task); this._block(reason); throw new ActionError(reason, 409); }
-        if (this._workspaceChatBusy()) throw new ActionError('普通聊天仍在生成；请等待完成或停止后再核查', 409);
-        if (!this._canEnterWorkspace('read-only', 'workflow')) throw new ActionError('同目录存在写入任务或只读名额已满，请完成或暂停后再核查', 409);
-        if (this._agentBusy(this.state.leaderId)) throw new ActionError('监工正在处理另一项工作，请稍后核查', 409);
+        const canReview = () => {
+          if (this.closed) throw new ActionError('协作服务已关闭，未启动核查', 503);
+          this._requireCooperation();
+          if (this.state.pendingCleanup.length || [...this.retiringRuns.values()].some(run => run.cleanupFailed)) throw new ActionError('旧执行尚未确认退出，未启动核查', 503);
+          if (this.persistenceFailure) throw new ActionError('状态尚未保存，未启动核查；请先重试保存', 503);
+          if (task.status === 'accepted' || this.reviewLocks.has(task.id)) return false;
+          if (task.status !== 'reviewing') throw new ActionError('只有已完成输出、等待核查的任务可以验收', 409);
+          if (this._reviewExhausted(task)) { const reason = this._reviewLimitMessage(task); this._block(reason); throw new ActionError(reason, 409); }
+          if (this._workspaceChatBusy()) throw new ActionError('普通聊天仍在生成；请等待完成或停止后再核查', 409);
+          if (!this._canEnterWorkspace('read-only', 'workflow')) throw new ActionError('同目录存在写入任务或只读名额已满，请完成或暂停后再核查', 409);
+          if (this._agentBusy(this.state.leaderId)) throw new ActionError('监工正在处理另一项工作，请稍后核查', 409);
+          return true;
+        };
+        if (!canReview()) return this.getState();
+        if (this.state.mode === 'live') {
+          const capabilities = await this.getCapabilities();
+          // Check only the monitor's channel; retained output needs no new worker.
+          if (!canReview()) return this.getState();
+          const monitor = this._leader();
+          const available = monitor?.provider === 'codex' ? capabilities.codex?.available : capabilities.harness?.available;
+          if (!monitor || available !== true) throw new ActionError('当前监工渠道尚未就绪，未启动核查；调用与核查次数保持不变', 409);
+        }
         this.state.phase = 'running'; delete this.state.error;
         this._startReview(task); this._emit(); break;
       }
