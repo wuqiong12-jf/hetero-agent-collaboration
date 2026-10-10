@@ -183,7 +183,7 @@ test('live mode creates a plan from the user goal, serializes shared-workspace w
   assert.ok(state.tasks.every((task) => !task.output.includes('test tool activity')));
 });
 
-test('a malformed or incomplete live acceptance is rejected rather than marked complete', async (t) => {
+test('a malformed or incomplete live acceptance preserves the delivery awaiting re-review', async (t) => {
   const initial = createInitialState(); initial.mode = 'live'; initial.tasks = [initial.tasks[1]]; initial.settings.maxRetries = 0;
   const providers = { getCapabilities: available, runAgent: async ({ prompt }) => prompt.startsWith('你是监工')
     ? { text: JSON.stringify({ verdict: 'accepted', criteria: [], feedback: 'looks good' }) }
@@ -191,9 +191,12 @@ test('a malformed or incomplete live acceptance is rejected rather than marked c
   const engine = workflowEngine({ initialState: initial, providers, demoDelayMs: 2 }); t.after(() => engine.close());
   await engine.action({ action: 'start' });
   const state = await until(engine, (snapshot) => snapshot.phase === 'blocked');
-  assert.equal(state.tasks[0].status, 'rejected');
-  assert.ok(state.tasks[0].criteria.every((criterion) => criterion.status === 'failed'));
-  assert.match(state.tasks[0].feedback, /缺少唯一结果或证据/);
+  assert.equal(state.tasks[0].status, 'reviewing');
+  assert.equal(state.tasks[0].attempt, 1); assert.equal(state.usage.workerCalls, 1);
+  assert.equal(state.tasks[0].output, 'claimed work without evidence');
+  assert.ok(state.tasks[0].criteria.every((criterion) => criterion.status === 'pending'));
+  assert.match(state.tasks[0].reviewError, /缺少唯一结果或证据/);
+  assert.equal(state.tasks[0].feedback, undefined);
 });
 
 test('starting unconfigured live adapters does not call a model', async (t) => {
@@ -310,10 +313,12 @@ test('invalid follow-up JSON, duplicate IDs, unknown dependencies, cycles, task 
     await engine.action({ action: 'resume' });
     const state = await until(engine, (snapshot) => snapshot.phase === 'blocked');
     assert.equal(state.tasks.length, initial.tasks.length, fixture.name);
-    assert.equal(state.tasks[0].status, 'rejected', fixture.name);
+    assert.equal(state.tasks[0].status, 'reviewing', fixture.name);
     assert.equal(state.tasks[1].status, 'queued', fixture.name);
     assert.equal(state.usage.workerCalls, 0, fixture.name);
-    assert.ok(state.tasks[0].criteria.every((criterion) => criterion.status === 'failed'), fixture.name);
+    assert.deepEqual(state.tasks[0].criteria, initial.tasks[0].criteria, fixture.name);
+    assert.equal(state.tasks[0].output, initial.tasks[0].output, fixture.name);
+    assert.ok(state.tasks[0].reviewError, fixture.name);
   }
 });
 

@@ -54,7 +54,9 @@ input::placeholder, textarea::placeholder { color: #989da6; }
 .hidden-count { display: inline-flex; align-items: center; gap: 4px; color: #9693a0; font-size: 11px; }
 .team-button { display: inline-flex; align-items: center; gap: 5px; padding: 4px 6px; border: 1px solid #e7e2ed; border-radius: 5px; color: #867096; font-size: 11px; }
 .team-button i { width: 5px; height: 5px; border-radius: 50%; background: #75a78d; }
-.cooperation-status { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-height: 29px; flex: 0 0 auto; padding: 4px 12px; border-bottom: 1px solid #eeeaf2; background: #fbf9fe; font-size: 11px; color: #94859e; }
+.cooperation-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; min-height: 29px; flex: 0 0 auto; padding: 4px 12px; border-bottom: 1px solid #eeeaf2; background: #fbf9fe; font-size: 11px; color: #94859e; }
+.cooperation-status > span { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
+.cooperation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .cooperation-status button { display: inline-flex; align-items: center; gap: 5px; min-width: 0; text-align: left; overflow-wrap: anywhere; }
 .model-controls { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; width: 100%; min-width: 0; }
 .model-controls .model-select { flex: 1 1 116px; min-width: 70px; }
@@ -289,7 +291,18 @@ body.resizing, body.resizing * { cursor: col-resize !important; user-select: non
 .session-row small { display: block; margin-top: 4px; color: #aab3c0; font-size: 11px; }
 .workflow-field { display: flex; flex-direction: column; gap: 6px; }
 .workflow-field.inline { flex-direction: row; align-items: center; gap: 14px; }
+.modal-content .workflow-field.inline { flex-wrap: wrap; }
+.modal-content .workflow-field.inline input[type="number"] { width: 76px; flex: 0 0 76px; margin-left: auto; }
+.workflow-field.inline small { font-size: 11px; }
 .workflow-field.inline select { flex: 1; min-width: 0; max-width: 240px; }
+.review-problems { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.review-problems > strong { color: #8b779e; font-size: 13px; }
+.review-problem { display: flex; flex-direction: column; gap: 5px; padding: 12px; border: 1px solid #e8e2ef; border-radius: 7px; background: #fcfbfe; min-width: 0; overflow-wrap: anywhere; }
+.review-problem > strong { color: #68758a; font-size: 12px; }
+.review-problem small { font-size: 11px; color: #949ead; }
+.review-problem > p { color: #8c779c; font-size: 12px; white-space: pre-wrap; }
+.review-problem-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 10px; margin-top: 5px; }
+.review-problem-actions small { flex: 1 1 180px; min-width: 0; }
 .workflow-check { display: flex; align-items: center; gap: 8px; }
 .workflow-check input { margin: 0; flex-shrink: 0; }
 .workflow-fields { display: flex; flex-direction: column; gap: 14px; }

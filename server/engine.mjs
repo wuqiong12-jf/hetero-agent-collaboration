@@ -6,7 +6,7 @@ const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}-${randomUUID()}`;
 const clone = (value) => structuredClone(value);
 const truncate = (value, max = 100_000) => String(value ?? '').slice(0, max);
-const defaults = { autoReview: true, autoDispatch: true, maxRetries: 2, maxSupervisorCalls: 12, maxWorkerCalls: 16, maxProviderCalls: { codex: 12, deepseek: 16 }, maxParallelReaders: 3 };
+const defaults = { autoReview: true, autoDispatch: true, maxRetries: 2, maxReviewRetries: 1, maxSupervisorCalls: 12, maxWorkerCalls: 16, maxProviderCalls: { codex: 12, deepseek: 16 }, maxParallelReaders: 3 };
 const MAX_TASKS = 12;
 const PROVIDERS = new Set(['codex', 'deepseek']);
 const EFFORTS = new Set(['auto', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
@@ -154,6 +154,8 @@ export class Orchestrator {
     }
     this.state.settings.maxProviderCalls = { ...defaults.maxProviderCalls, ...this.state.settings.maxProviderCalls };
     this.state.settings.maxParallelReaders ??= defaults.maxParallelReaders;
+    if (!Number.isInteger(this.state.settings.maxReviewRetries) || this.state.settings.maxReviewRetries < 0 || this.state.settings.maxReviewRetries > 10) this.state.settings.maxReviewRetries = defaults.maxReviewRetries;
+    for (const task of this.state.tasks) if (!Number.isSafeInteger(task.reviewAttempts) || task.reviewAttempts < 0) task.reviewAttempts = 0;
     this.state.usage.providerCalls = { codex: 0, deepseek: 0, ...this.state.usage.providerCalls };
     this.state.usage.autoProviderCalls = { ...this.state.usage.providerCalls, ...this.state.usage.autoProviderCalls };
     this.state.usage.autoSupervisorCalls ??= this.state.usage.supervisorCalls;
@@ -293,6 +295,10 @@ export class Orchestrator {
           if (this.state.mode === 'live' && value < this._workspaceCounts().readers) throw new ActionError('请等待当前只读任务完成后再降低并行上限', 409);
           next.maxParallelReaders = value;
         }
+        if ('maxReviewRetries' in settings) {
+          if (!Number.isInteger(settings.maxReviewRetries) || settings.maxReviewRetries < 0 || settings.maxReviewRetries > 10) throw new ActionError('额外核查上限必须是 0–10 的整数');
+          next.maxReviewRetries = settings.maxReviewRetries;
+        }
         if ('maxProviderCalls' in settings) {
           if (!settings.maxProviderCalls || typeof settings.maxProviderCalls !== 'object' || Array.isArray(settings.maxProviderCalls)) throw new ActionError('maxProviderCalls 必须是提供方预算对象');
           next.maxProviderCalls = { ...this.state.settings.maxProviderCalls };
@@ -325,6 +331,7 @@ export class Orchestrator {
         if (task.status === 'accepted') return this.getState();
         if (task.status !== 'reviewing') throw new ActionError('只有已完成输出、等待核查的任务可以验收', 409);
         if (this.reviewLocks.has(task.id)) return this.getState();
+        if (this._reviewExhausted(task)) { const reason = this._reviewLimitMessage(task); this._block(reason); throw new ActionError(reason, 409); }
         if (this._workspaceChatBusy()) throw new ActionError('普通聊天仍在生成；请等待完成或停止后再核查', 409);
         if (!this._canEnterWorkspace('read-only', 'workflow')) throw new ActionError('同目录存在写入任务或只读名额已满，请完成或暂停后再核查', 409);
         if (this._agentBusy(this.state.leaderId)) throw new ActionError('监工正在处理另一项工作，请稍后核查', 409);
@@ -885,6 +892,7 @@ export class Orchestrator {
     if (!this._canEnterWorkspace(worker.accessMode, 'workflow')) return;
     if (!this._reserve('worker', worker)) return;
     task.agentId = worker.id; task.status = 'running'; task.attempt += 1; task.output = '';
+    task.reviewAttempts = 0; delete task.reviewError;
     task.criteria.forEach((item) => { item.status = 'pending'; delete item.evidence; });
     const token = this._runToken('worker', worker.id, task, worker.accessMode);
     const prompt = this._workerPrompt(task);
@@ -938,9 +946,25 @@ export class Orchestrator {
     return { text };
   }
 
+  _reviewExhausted(task) { return (task.reviewAttempts || 0) >= 1 + this.state.settings.maxReviewRetries; }
+  _reviewLimitMessage(task) {
+    return `「${task.title}」已达到核查上限（首次加 ${this.state.settings.maxReviewRetries} 次额外调用，已启动 ${task.reviewAttempts || 0} 次）。工作者交付和验收条件已保留；请调整额外核查上限或相关调用预算后，仅重新核查。`;
+  }
+  _reviewFailed(task, error, token, message, { response, automatic = false } = {}) {
+    if (!this._valid(token, true) || task.status !== 'reviewing' || task.attempt !== token.attempt || this.reviewLocks.get(task.id) !== token) return;
+    task.reviewError = truncate(error.message || '核查未完成', 1200);
+    message.text = `${this._tag()}${automatic ? '核查结果无效' : '核查调用未完成'}：${task.title}\n原因：${task.reviewError}\n原交付、验收条件与返工反馈保持不变；这不是交付不达标的判定。已启动核查 ${task.reviewAttempts} 次。${response !== undefined ? `\n未通过校验的监工原始回复：\n${truncate(response, 8000)}` : ''}`;
+    this._activity('review-error', `${this._tag()}${task.title} · 核查未完成，交付保留：${task.reviewError}`, task.id);
+    this._finish(token);
+    if (this._reviewExhausted(task)) { this._block(this._reviewLimitMessage(task)); return; }
+    if (!automatic) { this._block('监工核查调用失败。交付尚未验收，已保留；检查渠道后可仅重新核查。'); return; }
+    this._emit(); this._queuePump(this.demoDelayMs * 2);
+  }
   _startReview(task) {
     if (this.reviewLocks.has(task.id) || this._agentBusy(this.state.leaderId) || !this._canEnterWorkspace('read-only', 'workflow')) return false;
+    if (this._reviewExhausted(task)) { this._block(this._reviewLimitMessage(task)); return false; }
     if (!this._reserve('review', this._leader())) return false;
+    task.reviewAttempts = (task.reviewAttempts || 0) + 1;
     const leader = { ...clone(this._leader()), accessMode: 'read-only' }; const token = this._runToken('review', leader.id, task, 'read-only');
     this.reviewLocks.set(task.id, token);
     this._activity('review', `${this._tag()}${leader.name} 正在逐项核查：${task.title}`, task.id);
@@ -952,7 +976,7 @@ export class Orchestrator {
     const execution = Promise.resolve().then(() => {
       if (!this._valid(token, true)) throw abortError();
       return mode === 'demo' ? this._demoReview(task, token.controller.signal)
-        : this.providers.runAgent({ agent: leader, prompt, onDelta: (delta, meta) => {
+        : this.providers.runAgent({ agent: leader, prompt: prompt + (task.reviewError ? '\n上次核查未完成的原因：' + task.reviewError + '。本次只重新核查同一交付，修正核查输出；不要因此让工作者重做。仍按上述完整 JSON 结构返回。' : ''), onDelta: (delta, meta) => {
         if (meta?.type === 'tool' && this._valid(token, true)) { this._message(leader.id, 'assistant', 'tool', delta, task.id); this._emit(); }
       }, signal: token.controller.signal, workspace: this.workspace });
     });
@@ -962,13 +986,12 @@ export class Orchestrator {
       let review;
       try { review = this._validateReview(task, parseJson(result.text)); }
       catch (error) {
-        review = { verdict: 'rejected', feedback: `监工未返回可验证的验收结果：${error.message}。请补充完整、逐项、有证据的核查及有效的补充分工。`, criteria: task.criteria.map((criterion) => ({ id: criterion.id, status: 'failed', evidence: '审核结果或补充任务计划未通过结构、依赖或预算校验，未标记通过。' })) };
+        this._reviewFailed(task, error, token, message, { response: result.text, automatic: true }); return;
       }
       this._applyReview(task, review, token, message);
     }).catch((error) => {
       if (this._cleanupFailure(token, error) || !this._valid(token, true)) return;
-      message.text = `核查未完成：${truncate(error.message, 1200)}。工作者输出保留，任务等待再次核查。`;
-      this._finish(token); this._block('监工核查调用失败。任务尚未验收，请检查适配器后继续。');
+      this._reviewFailed(task, error, token, message);
     }).finally(() => this._providerSettled(token));
     return true;
   }
@@ -1027,6 +1050,7 @@ export class Orchestrator {
     if (!this._valid(token, true) || task.status !== 'reviewing' || this.reviewLocks.get(task.id) !== token) return;
     for (const criterion of task.criteria) Object.assign(criterion, review.criteria.find((item) => item.id === criterion.id));
     task.status = review.verdict; task.feedback = review.feedback;
+    delete task.reviewError;
     const followUpTasks = review.followUpTasks ?? [];
     for (const update of review.dependencyUpdates ?? []) this._task(update.id).dependsOn = update.dependsOn;
     this.state.tasks.push(...followUpTasks);
