@@ -221,6 +221,10 @@ export class Orchestrator {
     }
     switch (payload.action) {
       case 'saveGoalBrief': {
+        if (Object.hasOwn(payload, 'expectedStateId')) {
+          if (typeof payload.expectedStateId !== 'string' || !payload.expectedStateId || payload.expectedStateId.length > 256) throw new ActionError('保存草稿的 expectedStateId 必须是当前会话标识');
+          if (payload.expectedStateId !== this.state.id) throw new ActionError('协作会话已变化，请重新读取并核对任务委托书；未覆盖新会话草稿', 409);
+        }
         const current = this.state.goalDraft?.revision ?? 0;
         if (!Number.isSafeInteger(payload.expectedRevision) || payload.expectedRevision < 0) throw new ActionError('保存草稿必须提供整数 expectedRevision');
         if (payload.expectedRevision !== current) throw new ActionError('任务委托书已被更新，请先重新读取保存版本', 409);

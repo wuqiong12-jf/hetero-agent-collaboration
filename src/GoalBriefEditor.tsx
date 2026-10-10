@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Check, FileText, Loader2, RefreshCw, X } from 'lucide-react';
 import type { Agent, GoalBriefFields, GoalDraft, State } from './types';
+import GoalCoachHint from './GoalCoachHint';
 
 export const goalFieldLimits: Record<keyof GoalBriefFields, number> = { objective: 3000, deliverables: 3000, acceptance: 3000, constraints: 2000, questions: 1000 };
 const fieldDefinitions: { key: keyof GoalBriefFields; label: string; required?: boolean; example: string; help: string }[] = [
@@ -152,10 +153,11 @@ export default function GoalBriefEditor({ open, state, leader, workspace, pendin
         {(localError || requestError) && <div className="goal-notice error" role="alert">{localError && <span>{localError}</span>}{requestError && <small>{requestError}</small>}</div>}
         {notice && <p className="goal-notice" role="status">{notice}</p>}
         {objectiveChanged && <p className="goal-notice warning">目标已更改，请复核其余交付物、验收标准和约束；重新保存后才能确认。</p>}
-        {(revisionChanged || savedChanged) && <div className="goal-notice warning"><p>保存版已在其他窗口更新。当前编辑没有被覆盖，请重新载入后核对。</p><button className="button secondary" type="button" disabled={locked} onClick={reload}><RefreshCw size={13} />重新载入保存版</button></div>}
+        {(revisionChanged || savedChanged) && <div className="goal-notice warning"><p>保存版已由主聊天或其他窗口更新。当前编辑没有被覆盖，请重新载入后核对。</p><button className="button secondary" type="button" disabled={locked} onClick={reload}><RefreshCw size={13} />重新载入保存版</button></div>}
         {backup && <div className="goal-notice"><span>此前的本地编辑仍可恢复。</span><button className="button secondary" type="button" disabled={locked} onClick={() => { editGeneration.current += 1; setFields(copyGoalFields(backup)); setDirty(true); setStage('edit'); setBackup(undefined); setNotice('已恢复本地编辑。请对照最新保存版复核，保存后才可确认。'); }}>恢复本地编辑</button></div>}
         {stage === 'edit' ? <>
-          <p className="goal-introduction">先写清要交付什么、怎样算完成。带 * 的字段在确认前必填，草稿可不完整保存。这里不会调用模型；需要讨论时，可先在原生主聊天澄清，再把结论填入。</p>
+          <p className="goal-introduction">先写清要交付什么、怎样算完成。带 * 的字段在确认前必填，草稿可不完整保存。需要讨论时，可先让原生主聊天帮你梳理并保存。</p>
+          <GoalCoachHint fields={fields} disabled={locked} />
           <form id="goal-brief-form" className="goal-fields" onSubmit={event => { event.preventDefault(); save(); }}>
             {fieldDefinitions.map(field => <label className="goal-field" key={field.key}><span className="goal-field-heading"><strong>{field.label}{field.required ? ' *' : '（可选）'}</strong><small className={fields[field.key].length > goalFieldLimits[field.key] ? 'over-limit' : ''}>{fields[field.key].length}/{goalFieldLimits[field.key]}</small></span><textarea aria-label={'委托书' + field.label} aria-required={field.required || undefined} value={fields[field.key]} rows={field.key === 'constraints' || field.key === 'questions' ? 2 : 3} placeholder={field.example} disabled={locked} onChange={event => { editGeneration.current += 1; const value = event.target.value; if (field.key === 'objective' && saved?.objective.trim() && value.trim() !== saved.objective.trim()) setObjectiveChanged(true); setFields(old => ({ ...old, [field.key]: value })); setDirty(true); setLocalError(''); }} /><small className="goal-field-help">{field.help}</small></label>)}
           </form>

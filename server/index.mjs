@@ -59,7 +59,7 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
         if (!['codex', 'deepseek'].includes(provider)) throw new ActionError('模型提供商无效');
         sendJson(response, await modelCatalogProvider.getModels({ provider })); return;
       }
-      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.5.3' }); return; }
+      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.6.0' }); return; }
       if (request.method === 'GET' && url.pathname === '/api/events') {
         response.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform',

@@ -42,7 +42,7 @@ test('owned state is created only after binding, and context identifies the read
   assert.equal(created, 1);
   const response = await fetch(`http://127.0.0.1:${app.server.address().port}/api/context`);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {service:'relay-agent-workbench',protocolVersion:1,workspace:'C:/Projects/startup-fixture',version:'0.5.3'});
+  assert.deepEqual(await response.json(), {service:'relay-agent-workbench',protocolVersion:1,workspace:'C:/Projects/startup-fixture',version:'0.6.0'});
 });
 
 test('a competing startup cannot load or overwrite the running owner snapshot', async t => {

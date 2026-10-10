@@ -392,3 +392,10 @@ body.resizing, body.resizing * { cursor: col-resize !important; user-select: non
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: .01ms !important; animation: none !important; scroll-behavior: auto !important; }
 }
+.goal-coach { margin: 0 0 18px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface, #fafafd); }
+.goal-coach summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+.goal-coach p { margin: 10px 0; font-size: 11px; line-height: 1.7; color: var(--muted); }
+.goal-coach textarea { box-sizing: border-box; width: 100%; min-height: 110px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg, #fff); color: var(--text, #2d3138); font: inherit; font-size: 11px; line-height: 1.7; resize: vertical; }
+.goal-coach-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
+.goal-coach-actions small { flex: 1; min-width: 130px; font-size: 10px; line-height: 1.7; color: var(--muted); }
+.goal-coach .goal-coach-notice { margin-bottom: 0; }

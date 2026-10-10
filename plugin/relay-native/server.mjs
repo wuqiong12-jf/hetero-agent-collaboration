@@ -7,8 +7,8 @@ import { readFileSync } from 'node:fs';
 
 const pluginRoot = dirname(fileURLToPath(import.meta.url));
 const icon = {src:'data:image/png;base64,'+readFileSync(join(pluginRoot,'assets','icon.png')).toString('base64'),mimeType:'image/png',sizes:['256x256']};
-export const RESOURCE_URI = 'ui://relay/v0.5.3/workspace';
-export const PANEL_URI = 'ui://relay/v0.5.3/panel';
+export const RESOURCE_URI = 'ui://relay/v0.6.0/workspace';
+export const PANEL_URI = 'ui://relay/v0.6.0/panel';
 export const RESOURCE_MIME = 'text/html;profile=mcp-app';
 const versions = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
 const emptyInput = { type: 'object', properties: {}, additionalProperties: false };
@@ -18,6 +18,9 @@ const entryMetadata = {
   'openai/outputTemplate': RESOURCE_URI,
 };
 const waitSchema = { type: 'integer', minimum: 0, maximum: 45 };
+const briefLimits = { objective: 3000, deliverables: 3000, acceptance: 3000, constraints: 2000, questions: 1000 };
+const briefFields = Object.keys(briefLimits);
+const briefProperties = Object.fromEntries(Object.entries(briefLimits).map(([key, maxLength]) => [key, { type: 'string', maxLength }]));
 
 export const tools = [
   {
@@ -40,6 +43,21 @@ export const tools = [
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: entryMetadata,
+  },
+  {
+    name: 'get_task_brief',
+    title: '读取公共任务委托书草稿',
+    description: '用户要求梳理目标或写任务委托书时，供原生 Codex 主聊天读取当前 stateId、已保存的五字段草稿及 revision、必填及待决定问题、工作目录、模式、负责人摘要和粗略执行阻碍。后续保存须使用本次读取的 stateId 和 revision。只读取公开摘要，不返回聊天、执行目标、工作者产物或秘密配置；不调用推理模型、不派单。执行确认必须由用户在应用界面核对保存版本后完成，模型代码不得自行确认、启动或切换模式。',
+    inputSchema: emptyInput,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'save_task_brief',
+    title: '保存公共任务委托书草稿',
+    description: '用户要求梳理目标或写任务委托书时，供原生 Codex 主聊天保存五个文本字段；必须先用 get_task_brief 读取 stateId 和草稿 revision，分别传入 expectedStateId 和 expectedRevision。五字段全部必填，允许暂时留空；各字段有长度限制，合计不超过12000字符。仅保存草稿，不调用推理模型、不派单、不确认执行、不启动、不切换模式、不重置。执行确认由用户在应用界面核对保存版本后完成，模型代码不得自行确认。发生冲突时核对返回的当前会话与保存版，再与本地草稿比对，禁止自动覆盖；结果不确定时可能已经保存，先用 get_task_brief 核对，禁止自动重发。',
+    inputSchema: { type: 'object', properties: { ...briefProperties, expectedRevision: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, expectedStateId: { type: 'string', minLength: 1, maxLength: 256 } },
+      required: [...briefFields, 'expectedRevision', 'expectedStateId'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'agent_team_status',
@@ -95,6 +113,70 @@ function rpcError(message, code = -32602) { return Object.assign(new Error(messa
 function text(value, max = 200) { return typeof value === 'string' ? value.slice(0, max) : ''; }
 function publicResult(value, isError = false) {
   return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, ...(isError ? { isError: true } : {}) };
+}
+
+function validateBriefArgs(args, saving = false) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw rpcError('任务委托书参数必须是对象。');
+  const allowed = saving ? [...briefFields, 'expectedRevision', 'expectedStateId'] : [];
+  if (Object.keys(args).some(key => !allowed.includes(key))) throw rpcError('任务委托书包含不支持的参数。');
+  if (!saving) return {};
+  if (!Object.hasOwn(args, 'expectedRevision') || !Number.isSafeInteger(args.expectedRevision) || args.expectedRevision < 0) throw rpcError('expectedRevision 必须是大于等于0的安全整数。');
+  if (!Object.hasOwn(args, 'expectedStateId') || typeof args.expectedStateId !== 'string' || !args.expectedStateId.trim() || args.expectedStateId.length > 256 || args.expectedStateId.includes('\0')) throw rpcError('expectedStateId 必须是非空且不超过256字符的会话标识。');
+  const brief = {};
+  for (const [key, limit] of Object.entries(briefLimits)) {
+    if (!Object.hasOwn(args, key) || typeof args[key] !== 'string' || args[key].length > limit || args[key].includes('\0')) throw rpcError(`${key} 必须为不超过${limit}字符的文本。`);
+    brief[key] = args[key];
+  }
+  if (Object.values(brief).reduce((total, value) => total + value.length, 0) > 12000) throw rpcError('任务委托书五字段合计不能超过12000字符。');
+  return { brief, expectedRevision: args.expectedRevision, expectedStateId: args.expectedStateId };
+}
+
+function publicBrief(value) {
+  if (value === undefined) return { ...Object.fromEntries(briefFields.map(key => [key, ''])), revision: 0, updatedAt: null, confirmedAt: null };
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Number.isSafeInteger(value.revision) || value.revision < 1) throw new Error('无效任务委托书版本');
+  const fields = {};
+  for (const [key, limit] of Object.entries(briefLimits)) {
+    if (!Object.hasOwn(value, key) || typeof value[key] !== 'string' || value[key].length > limit || value[key].includes('\0')) throw new Error('无效任务委托书字段');
+    fields[key] = value[key];
+  }
+  const timestamp = date => typeof date === 'string' && date.length <= 100 && Number.isFinite(Date.parse(date));
+  if (!timestamp(value.updatedAt) || (value.confirmedAt !== undefined && value.confirmedAt !== null && !timestamp(value.confirmedAt))) throw new Error('无效任务委托书时间');
+  return { ...fields, revision: value.revision, updatedAt: value.updatedAt, confirmedAt: value.confirmedAt ?? null };
+}
+
+function briefProblems(draft) {
+  const labels = { objective: '目标', deliverables: '交付物', acceptance: '验收标准' };
+  const problems = Object.entries(labels).filter(([key]) => !draft[key].trim()).map(([field, label]) => ({ code: 'required', field, message: `确认前需填写${label}。` }));
+  if (draft.questions.trim()) problems.push({ code: 'unresolved', field: 'questions', message: '还有待决定问题，解决后需保存新版本。' });
+  return problems;
+}
+
+function briefSnapshot(state, workspace, draft = publicBrief(state.goalDraft)) {
+  if (typeof state.id !== 'string' || !state.id.trim() || state.id.length > 256 || state.id.includes('\0')) throw new Error('无效协作会话标识');
+  const agents = Array.isArray(state.agents) ? state.agents : [];
+  const leader = agents.find(agent => agent.id === state.leaderId);
+  const blockers = new Map();
+  const block = (code, message) => blockers.set(code, { code, message });
+  if (state.collaborationMode !== 'cooperative') block('cooperation-disabled', '合作模式尚未开启；草稿可以保存，执行确认需在界面处理。');
+  if (!leader) block('leader-unavailable', '当前负责人尚无法核实。');
+  if (state.phase === 'running') block('cooperation-running', '当前合作任务正在执行。');
+  if (agents.some(agent => ['running', 'reviewing'].includes(agent.status)) || Object.values(state.chatSessions || {}).some(session => session?.status === 'running') ||
+    ['readers', 'writers', 'retiringReaders', 'retiringWriters'].some(key => Number.isSafeInteger(state.executionSummary?.[key]) && state.executionSummary[key] > 0)) block('execution-busy', '仍有执行或停止中的工作，请等待完成并核实停止状态。');
+  const issueCodes = new Set(Array.isArray(state.recovery?.summary?.globalIssues) ? state.recovery.summary.globalIssues.map(issue => issue?.code) : []);
+  if ((Array.isArray(state.pendingCleanup) && state.pendingCleanup.length) || issueCodes.has('cleanup-unconfirmed')) block('cleanup-unconfirmed', '旧执行尚未确认退出，执行确认前需处理工作空间锁。');
+  if (issueCodes.has('persistence-failed')) block('persistence-failed', '当前状态尚未保存到磁盘，执行确认前需恢复保存。');
+  if (issueCodes.has('service-closed')) block('service-closed', '协作服务已经关闭。');
+  if (issueCodes.has('stopping')) block('stopping', '执行仍在停止，尚未确认退出。');
+  if (state.phase === 'blocked') block('blocked', '当前协作状态有阻碍，需在界面核对恢复条件。');
+  if (draft.confirmedAt) block('already-confirmed', '这个保存版本已由界面确认；新任务需先保存新版本。');
+  return {
+    stateId: state.id, draft, problems: briefProblems(draft), workspace: text(workspace, 2000),
+    mode: ['live', 'demo'].includes(state.mode) ? state.mode : null,
+    collaborationMode: ['independent', 'cooperative'].includes(state.collaborationMode) ? state.collaborationMode : null,
+    leader: leader ? { id: text(leader.id, 256), name: text(leader.name), provider: ['codex', 'deepseek'].includes(leader.provider) ? leader.provider : null,
+      model: text(leader.modelId || leader.model, 256), reasoningEffort: text(leader.reasoningEffort || 'auto', 40) } : null,
+    executionBlockers: [...blockers.values()],
+  };
 }
 
 function validateTeamArgs(args, delegation = false) {
@@ -184,6 +266,19 @@ function loopbackBase(value) {
 
 class LocalServiceError extends Error {}
 
+function validateServiceContext(context) {
+  if (!context || typeof context !== 'object' || Array.isArray(context) || context.service !== 'relay-agent-workbench') {
+    if (context && typeof context.workspace === 'string' && typeof context.version === 'string' && context.service === undefined) {
+      throw new LocalServiceError('本机服务缺少 Relay 服务标识，可能是旧版后台。请确认端口占用；旧版 Relay 需要停止并重启为当前版本。');
+    }
+    throw new LocalServiceError('本机端口上的服务不是 Relay 协作服务。请检查端口占用后重试。');
+  }
+  if (context.protocolVersion !== 1) throw new LocalServiceError('Relay 后台协议不兼容。请停止旧后台并启动当前项目服务后重试。');
+  if (typeof context.workspace !== 'string' || !context.workspace.trim() || typeof context.version !== 'string' || !context.version.trim()) {
+    throw new LocalServiceError('Relay 后台上下文无效，无法确认工作目录和版本。请重启当前项目服务后重试。');
+  }
+}
+
 async function startLocalService({ base }) {
   const root = process.env.RELAY_PROJECT_ROOT;
   if (!root) throw new LocalServiceError('本地协作服务尚未启动，且未配置项目启动目录。请启动当前项目服务后重试。');
@@ -259,16 +354,7 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
     let context;
     try { context = await response.json(); }
     catch { throw new LocalServiceError('本机端口已有服务响应，但服务上下文无法读取。请检查端口占用；旧版 Relay 后台需要重启。'); }
-    if (!context || typeof context !== 'object' || Array.isArray(context) || context.service !== 'relay-agent-workbench') {
-      if (context && typeof context.workspace === 'string' && typeof context.version === 'string' && context.service === undefined) {
-        throw new LocalServiceError('本机服务缺少 Relay 服务标识，可能是旧版后台。请确认端口占用；旧版 Relay 需要停止并重启为当前版本。');
-      }
-      throw new LocalServiceError('本机端口上的服务不是 Relay 协作服务。请检查端口占用后重试。');
-    }
-    if (context.protocolVersion !== 1) throw new LocalServiceError('Relay 后台协议不兼容。请停止旧后台并启动当前项目服务后重试。');
-    if (typeof context.workspace !== 'string' || !context.workspace.trim() || typeof context.version !== 'string' || !context.version.trim()) {
-      throw new LocalServiceError('Relay 后台上下文无效，无法确认工作目录和版本。请重启当前项目服务后重试。');
-    }
+    validateServiceContext(context);
     return true;
   };
   const ensureService = () => {
@@ -313,8 +399,58 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
   const readTeam = async () => {
     await ensureService();
     const [state, context] = await Promise.all([readState(), proxy({ route: '/api/context' }, { ensure: false, timeoutMs: 5000 })]);
-    if (!context.ok || typeof context.data?.workspace !== 'string') throw rpcError('无法核实工作目录。', -32001);
+    if (!context.ok) throw rpcError('无法核实工作目录。', -32001);
+    validateServiceContext(context.data);
     return { state, workspace: context.data.workspace };
+  };
+  const getBriefTool = async args => {
+    validateBriefArgs(args === undefined ? {} : args);
+    try {
+      const { state, workspace } = await readTeam();
+      return publicResult({ status: 'read', ...briefSnapshot(state, workspace), notice: '此结果仅为保存草稿及当前条件摘要；执行确认须由用户在应用界面核对保存版本后完成。' });
+    } catch (error) {
+      return publicResult({ status: 'unknown', error: error instanceof LocalServiceError ? error.message : '无法读取有效的公共任务委托书。请检查本地服务后使用 get_task_brief 重新核对。' }, true);
+    }
+  };
+  const saveBriefTool = async args => {
+    const request = validateBriefArgs(args, true);
+    let initial;
+    try { initial = await readTeam(); briefSnapshot(initial.state, initial.workspace); }
+    catch (error) {
+      return publicResult({ status: 'rejected', error: error instanceof LocalServiceError ? error.message : '无法核实当前本地协作服务，未提交任务委托书。请先使用 get_task_brief 核对。' }, true);
+    }
+    const unknown = () => publicResult({ status: 'unknown', expectedRevision: request.expectedRevision, expectedStateId: request.expectedStateId,
+      error: '保存结果未确认，草稿可能已经保存。请保留本地草稿，先用 get_task_brief 核对保存字段与版本；不要自动重发保存请求。' }, true);
+    const response = await proxy({ route: '/api/actions', method: 'POST', body: {
+      action: 'saveGoalBrief', brief: request.brief, expectedRevision: request.expectedRevision, expectedStateId: request.expectedStateId,
+    } }, { ensure: false, timeoutMs: 45000 });
+    if (response.status === 409) {
+      try {
+        const { state, workspace } = await readTeam();
+        const snapshot = briefSnapshot(state, workspace);
+        const differentFields = briefFields.filter(key => snapshot.draft[key] !== request.brief[key]);
+        return publicResult({ status: 'conflict', ...snapshot, expectedRevision: request.expectedRevision, expectedStateId: request.expectedStateId,
+          comparison: { differentFields, sameContent: differentFields.length === 0, stateChanged: snapshot.stateId !== request.expectedStateId },
+          error: '保存版本已变化，本次保存被拒绝。请将返回的最新保存版与本地草稿逐项比对，再由用户决定保留哪些修改；不要自动覆盖。' }, true);
+      } catch {
+        return publicResult({ status: 'conflict', draft: null, comparison: null, expectedRevision: request.expectedRevision, expectedStateId: request.expectedStateId,
+          error: '保存版本发生冲突，本次保存被拒绝，但最新保存版暂时无法读取。请保留本地草稿，用 get_task_brief 重新读取并比对；不要自动覆盖。' }, true);
+      }
+    }
+    if (!response.ok) {
+      if ([400, 403, 404, 422].includes(response.status)) return publicResult({ status: 'rejected',
+        error: '本地服务拒绝了本次草稿保存。请保留本地草稿，使用 get_task_brief 核对服务及保存版本后再处理。' }, true);
+      return unknown();
+    }
+    try {
+      const draft = publicBrief(response.data?.goalDraft);
+      if (response.data?.id !== request.expectedStateId || draft.revision !== request.expectedRevision + 1 || draft.confirmedAt !== null || briefFields.some(key => draft[key] !== request.brief[key])) return unknown();
+      // Report exactly the version returned by this POST. A later GET could be
+      // another client's save and must never be presented as this submission.
+      const snapshot = briefSnapshot(response.data, initial.workspace, draft);
+      return publicResult({ status: 'saved', ...snapshot,
+        notice: `任务委托书草稿 v${draft.revision} 已保存。执行确认须由用户在应用界面核对保存版本后完成。` });
+    } catch { return unknown(); }
   };
   const waitForReply = async (state, reference, waitSeconds, maximumDeadline = Infinity) => {
     const deadline = Math.min(now() + waitSeconds * 1000, maximumDeadline);
@@ -388,14 +524,14 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
       if (method === 'initialize') return {
         protocolVersion: versions.has(params.protocolVersion) ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: {listChanged:true}, resources: { subscribe: false, listChanged: true }, extensions: { 'io.modelcontextprotocol/ui': {} } },
-        serverInfo: { name: 'relay-native', title: '异智能体合作', version: '0.5.3', icons: [icon] },
+        serverInfo: { name: 'relay-native', title: '异智能体合作', version: '0.6.0', icons: [icon] },
       };
       if (method === 'ping') return {};
       if (method === 'tools/list') return { tools };
       if (method === 'resources/list') return { resources: [resource,{...resource,uri:PANEL_URI,name:'relay-panel',title:'异智能体'}] };
       if (method === 'resources/templates/list') return { resourceTemplates: [] };
       if (method === 'resources/read') {
-        if (![RESOURCE_URI,PANEL_URI,'ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel','ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel','ui://relay/v0.3.0/workspace','ui://relay/v0.3.0/panel','ui://relay/v0.2.4/workspace','ui://relay/v0.2.4/panel','ui://relay/v0.2.3/workspace','ui://relay/v0.2.3/panel','ui://relay/v0.2.2/workspace','ui://relay/v0.2.2/panel','ui://relay/workspace','ui://relay/panel'].includes(params.uri)) throw rpcError('UI 资源不存在。');
+        if (![RESOURCE_URI,PANEL_URI,'ui://relay/v0.5.3/workspace','ui://relay/v0.5.3/panel','ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel','ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel','ui://relay/v0.3.0/workspace','ui://relay/v0.3.0/panel','ui://relay/v0.2.4/workspace','ui://relay/v0.2.4/panel','ui://relay/v0.2.3/workspace','ui://relay/v0.2.3/panel','ui://relay/v0.2.2/workspace','ui://relay/v0.2.2/panel','ui://relay/workspace','ui://relay/panel'].includes(params.uri)) throw rpcError('UI 资源不存在。');
         let html=await inlineBundle(distRoot);
         if(params.uri===PANEL_URI || params.uri.endsWith('/panel')) html=html.replace('window.__RELAY_NATIVE__=true;',"window.__RELAY_NATIVE__=true;window.__RELAY_VIEW__='deepseek';");
         return { contents: [{
@@ -408,6 +544,8 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
         }] };
       }
       if (method === 'tools/call') {
+        if (params.name === 'get_task_brief') return getBriefTool(params.arguments);
+        if (params.name === 'save_task_brief') return saveBriefTool(params.arguments);
         if (params.name === 'agent_team_status') return statusTool(params.arguments);
         if (params.name === 'delegate_agent_task') return delegateTool(params.arguments);
         if(params.name==='open_relay_panel') return {content:[{type:'text',text:'异智能体侧面板已打开。'}],structuredContent:{view:'deepseek',transport:'mcp'}};
