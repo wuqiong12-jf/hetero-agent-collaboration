@@ -7,8 +7,8 @@ import { readFileSync } from 'node:fs';
 
 const pluginRoot = dirname(fileURLToPath(import.meta.url));
 const icon = {src:'data:image/png;base64,'+readFileSync(join(pluginRoot,'assets','icon.png')).toString('base64'),mimeType:'image/png',sizes:['256x256']};
-export const RESOURCE_URI = 'ui://relay/v0.5.2/workspace';
-export const PANEL_URI = 'ui://relay/v0.5.2/panel';
+export const RESOURCE_URI = 'ui://relay/v0.5.3/workspace';
+export const PANEL_URI = 'ui://relay/v0.5.3/panel';
 export const RESOURCE_MIME = 'text/html;profile=mcp-app';
 const versions = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
 const emptyInput = { type: 'object', properties: {}, additionalProperties: false };
@@ -182,6 +182,25 @@ function loopbackBase(value) {
   return url;
 }
 
+class LocalServiceError extends Error {}
+
+async function startLocalService({ base }) {
+  const root = process.env.RELAY_PROJECT_ROOT;
+  if (!root) throw new LocalServiceError('本地协作服务尚未启动，且未配置项目启动目录。请启动当前项目服务后重试。');
+  try { await readFile(join(root, 'server', 'index.mjs')); }
+  catch { throw new LocalServiceError('无法读取本地项目服务入口。请检查项目安装后重试。'); }
+  try {
+    const child = spawn(process.execPath, [join(root, 'server', 'index.mjs')], {
+      cwd: root, detached: true, windowsHide: true, stdio: 'ignore',
+      env: { ...process.env, HOST: base.hostname.replace(/^\[|\]$/g, ''), PORT: base.port || '80' },
+    });
+    await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('spawn', () => { child.unref(); resolve(); });
+    });
+  } catch { throw new LocalServiceError('无法启动本地协作服务。请检查项目安装和启动权限后重试。'); }
+}
+
 export function validateRequest(args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw rpcError('请求参数必须是对象。');
   if (Object.keys(args).some(key => !['route', 'method', 'body'].includes(key))) throw rpcError('请求包含不支持的参数。');
@@ -229,27 +248,41 @@ export async function inlineBundle(distRoot) {
 }
 
 export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = process.env.RELAY_API_BASE || 'http://127.0.0.1:4318', fetcher = fetch,
-  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now, pollIntervalMs = 500 } = {}) {
+  startService = startLocalService, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now, pollIntervalMs = 500 } = {}) {
   const base = loopbackBase(apiBase);
   let starting;
-  const ensureService = async () => {
-    const ready = async () => {
-      try { const response = await fetcher(new URL('/api/context',base),{signal:AbortSignal.timeout(1500),redirect:'error'}); return response.ok; }
-      catch { return false; }
-    };
-    if (await ready()) return;
-    const root = process.env.RELAY_PROJECT_ROOT;
-    if (!root) throw new Error('本地服务尚未启动。');
+  const ready = async () => {
+    let response;
+    try { response = await fetcher(new URL('/api/context', base), { signal: AbortSignal.timeout(1500), redirect: 'error' }); }
+    catch { return false; }
+    if (!response.ok) throw new LocalServiceError('本机端口已有服务响应，但无法确认是 Relay 协作服务。请检查端口占用后重试。');
+    let context;
+    try { context = await response.json(); }
+    catch { throw new LocalServiceError('本机端口已有服务响应，但服务上下文无法读取。请检查端口占用；旧版 Relay 后台需要重启。'); }
+    if (!context || typeof context !== 'object' || Array.isArray(context) || context.service !== 'relay-agent-workbench') {
+      if (context && typeof context.workspace === 'string' && typeof context.version === 'string' && context.service === undefined) {
+        throw new LocalServiceError('本机服务缺少 Relay 服务标识，可能是旧版后台。请确认端口占用；旧版 Relay 需要停止并重启为当前版本。');
+      }
+      throw new LocalServiceError('本机端口上的服务不是 Relay 协作服务。请检查端口占用后重试。');
+    }
+    if (context.protocolVersion !== 1) throw new LocalServiceError('Relay 后台协议不兼容。请停止旧后台并启动当前项目服务后重试。');
+    if (typeof context.workspace !== 'string' || !context.workspace.trim() || typeof context.version !== 'string' || !context.version.trim()) {
+      throw new LocalServiceError('Relay 后台上下文无效，无法确认工作目录和版本。请重启当前项目服务后重试。');
+    }
+    return true;
+  };
+  const ensureService = () => {
     if (!starting) starting = (async () => {
-      await readFile(join(root,'server','index.mjs'));
-      const process = spawn(globalThis.process.execPath,[join(root,'server','index.mjs')],{
-        cwd:root,detached:true,windowsHide:true,stdio:'ignore',env:globalThis.process.env,
-      });
-      process.on('error',()=>{}); process.unref();
-      for(let attempt=0;attempt<15;attempt++) {await new Promise(resolve=>setTimeout(resolve,500));if(await ready())return;}
-      throw new Error('本地服务未能启动。');
-    })().finally(()=>{starting=undefined;});
-    await starting;
+      if (await ready()) return;
+      try { await startService({ base }); }
+      catch (error) {
+        if (error instanceof LocalServiceError) throw error;
+        throw new LocalServiceError('无法启动本地协作服务。请检查项目安装和启动权限后重试。');
+      }
+      for (let attempt = 0; attempt < 15; attempt++) { await sleep(500); if (await ready()) return; }
+      throw new LocalServiceError('本地协作服务启动后未能就绪。请检查端口和项目服务后重试。');
+    })().finally(() => { starting = undefined; });
+    return starting;
   };
   const resource = {
     uri: RESOURCE_URI, name: 'relay-workspace', title: '异智能体合作',
@@ -268,8 +301,8 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
       const result = { ok: response.ok, status: response.status, data };
       if (!response.ok) result.error = typeof data?.error === 'string' ? data.error : '本地协作请求未完成。';
       return result;
-    } catch {
-      return { ok: false, status: 503, data: null, error: '无法连接本地协作服务。请启动项目服务后重试。' };
+    } catch (error) {
+      return { ok: false, status: 503, data: null, error: error instanceof LocalServiceError ? error.message : '无法连接本地协作服务。请启动项目服务后重试。' };
     }
   };
   const readState = async (timeoutMs = 5000) => {
@@ -355,14 +388,14 @@ export function createProtocol({ distRoot = join(pluginRoot, 'dist'), apiBase = 
       if (method === 'initialize') return {
         protocolVersion: versions.has(params.protocolVersion) ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: {listChanged:true}, resources: { subscribe: false, listChanged: true }, extensions: { 'io.modelcontextprotocol/ui': {} } },
-        serverInfo: { name: 'relay-native', title: '异智能体合作', version: '0.5.2', icons: [icon] },
+        serverInfo: { name: 'relay-native', title: '异智能体合作', version: '0.5.3', icons: [icon] },
       };
       if (method === 'ping') return {};
       if (method === 'tools/list') return { tools };
       if (method === 'resources/list') return { resources: [resource,{...resource,uri:PANEL_URI,name:'relay-panel',title:'异智能体'}] };
       if (method === 'resources/templates/list') return { resourceTemplates: [] };
       if (method === 'resources/read') {
-        if (![RESOURCE_URI,PANEL_URI,'ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel','ui://relay/v0.3.0/workspace','ui://relay/v0.3.0/panel','ui://relay/v0.2.4/workspace','ui://relay/v0.2.4/panel','ui://relay/v0.2.3/workspace','ui://relay/v0.2.3/panel','ui://relay/v0.2.2/workspace','ui://relay/v0.2.2/panel','ui://relay/workspace','ui://relay/panel'].includes(params.uri)) throw rpcError('UI 资源不存在。');
+        if (![RESOURCE_URI,PANEL_URI,'ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel','ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel','ui://relay/v0.3.0/workspace','ui://relay/v0.3.0/panel','ui://relay/v0.2.4/workspace','ui://relay/v0.2.4/panel','ui://relay/v0.2.3/workspace','ui://relay/v0.2.3/panel','ui://relay/v0.2.2/workspace','ui://relay/v0.2.2/panel','ui://relay/workspace','ui://relay/panel'].includes(params.uri)) throw rpcError('UI 资源不存在。');
         let html=await inlineBundle(distRoot);
         if(params.uri===PANEL_URI || params.uri.endsWith('/panel')) html=html.replace('window.__RELAY_NATIVE__=true;',"window.__RELAY_NATIVE__=true;window.__RELAY_VIEW__='deepseek';");
         return { contents: [{

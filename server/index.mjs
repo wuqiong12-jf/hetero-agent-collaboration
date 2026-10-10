@@ -31,8 +31,13 @@ async function readJson(request) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new ActionError('请求必须是有效 JSON'); }
 }
 
-export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPACE || projectRoot, host = '127.0.0.1', port = 4318, assetsRoot = join(projectRoot, 'dist'), modelCatalogProvider = providers } = {}) {
-  const orchestrator = engine ?? new Orchestrator({ providers, workspace, persistencePath: join(projectRoot, '.relay', 'state.json') });
+export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPACE || projectRoot, host = '127.0.0.1', port = 4318, assetsRoot = join(projectRoot, 'dist'), modelCatalogProvider = providers,
+  persistencePath = join(projectRoot, '.relay', 'state.json'), engineFactory = options => new Orchestrator(options) } = {}) {
+  // Restoring an engine also writes a new snapshot. An instance that loses the
+  // port race must never load or overwrite the running instance's saved work.
+  let orchestrator = engine;
+  let stopping = false;
+  let closingPromise;
   const clients = new Set();
   const trustedOrigins = new Set([
     `http://127.0.0.1:${port}`, `http://localhost:${port}`,
@@ -42,6 +47,7 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
   const server = createServer(async (request, response) => {
     try {
       response.setHeader('X-Content-Type-Options', 'nosniff');
+      if (stopping || !orchestrator) { sendJson(response, { error: '本地服务尚未就绪或正在关闭，请稍后重试' }, 503); return; }
       const url = new URL(request.url || '/', `http://${host}:${port}`);
       if (url.pathname.startsWith('/api/') && request.headers.origin && !trustedOrigins.has(request.headers.origin)) {
         sendJson(response, { error: '这个来源不能访问本地协作服务' }, 403); return;
@@ -53,7 +59,7 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
         if (!['codex', 'deepseek'].includes(provider)) throw new ActionError('模型提供商无效');
         sendJson(response, await modelCatalogProvider.getModels({ provider })); return;
       }
-      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { workspace: orchestrator.workspace, version: '0.5.2' }); return; }
+      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.5.3' }); return; }
       if (request.method === 'GET' && url.pathname === '/api/events') {
         response.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform',
@@ -61,9 +67,9 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
         });
         response.write(`event: snapshot\ndata: ${JSON.stringify(orchestrator.getState())}\n\n`);
         const unsubscribe = orchestrator.subscribe((state) => {
-          if (!response.destroyed) response.write(`event: snapshot\ndata: ${JSON.stringify(state)}\n\n`);
+          if (!stopping && !response.destroyed && !response.writableEnded) response.write(`event: snapshot\ndata: ${JSON.stringify(state)}\n\n`);
         });
-        const heartbeat = setInterval(() => { if (!response.destroyed) response.write(': heartbeat\n\n'); }, 20_000);
+        const heartbeat = setInterval(() => { if (!stopping && !response.destroyed && !response.writableEnded) response.write(': heartbeat\n\n'); }, 20_000);
         clients.add(response);
         const cleanup = () => { clearInterval(heartbeat); unsubscribe(); clients.delete(response); };
         response.on('close', cleanup); return;
@@ -89,12 +95,30 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
       else response.end();
     }
   });
+  server.once('listening', () => {
+    if (stopping) return;
+    try { orchestrator ??= engineFactory({ providers, workspace, persistencePath }); }
+    catch (error) {
+      // Release the port even if a supplied engine factory fails to initialize.
+      void close().catch(() => {});
+      server.emit('error', error);
+    }
+  });
   const close = () => {
-    orchestrator.close();
+    if (closingPromise) return closingPromise;
+    stopping = true;
+    const executionClosed = Promise.resolve().then(() => orchestrator?.close() ?? true);
     for (const client of clients) client.end();
-    server.close();
+    const httpClosed = new Promise((resolveClosed, reject) => {
+      server.close(error => {
+        if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error);
+        else resolveClosed();
+      });
+    });
+    closingPromise = Promise.all([executionClosed, httpClosed]).then(([confirmed]) => confirmed !== false);
+    return closingPromise;
   };
-  return { server, engine: orchestrator, close };
+  return { server, get engine() { return orchestrator; }, close };
 }
 
 if (isMain) {
@@ -102,10 +126,10 @@ if (isMain) {
   const port = Number(process.env.PORT || 4318);
   const app = createAppServer({ host, port });
   app.server.listen(port, host, () => {
+    if (!app.engine) return;
     process.stdout.write(`Relay 协作服务：http://${host}:${port}\n默认演示模式；状态保存在 .relay/state.json\n`);
   });
-  app.server.on('error', (error) => { process.stderr.write(`服务启动失败：${error.message}\n`); process.exitCode = 1; });
-  let stopping = false;
-  const shutdown = () => { if (stopping) return; stopping = true; app.close(); };
+  app.server.on('error', (error) => { process.stderr.write(`服务启动失败：${error.message}\n`); process.exitCode = 1; void app.close().catch(() => { process.stderr.write('后台关闭未完成，请保留状态文件并检查执行清理。\n'); }); });
+  const shutdown = () => { void app.close().then(confirmed => { if (!confirmed) { process.exitCode = 1; process.stderr.write('后台仍有未确认的清理或保存问题，已有状态屏障保留。\n'); } }).catch(() => { process.exitCode = 1; process.stderr.write('后台关闭未完成，请保留状态文件并检查执行清理。\n'); }); };
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 }

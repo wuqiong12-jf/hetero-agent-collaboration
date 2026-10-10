@@ -235,7 +235,7 @@ test('HTTP preserves UTF-8 split across chunks and SSE delivers the resulting fu
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening');
   const address = app.server.address(); const url = `http://127.0.0.1:${address.port}`;
   const eventsController = new AbortController();
-  t.after(() => { eventsController.abort(); app.close(); });
+  t.after(() => { eventsController.abort(); return app.close(); });
   const events = await fetch(`${url}/api/events`, { signal: eventsController.signal });
   assert.equal(events.headers.get('content-type'), 'text/event-stream; charset=utf-8');
   const reader = events.body.getReader();

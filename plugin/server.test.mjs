@@ -6,6 +6,13 @@ import {tmpdir} from 'node:os';
 import {join,dirname,resolve,basename} from 'node:path';
 import {Script} from 'node:vm';
 
+function serviceContext(extra={}) {
+  return {service:'relay-agent-workbench',protocolVersion:1,workspace:'C:\\work',version:'0.5.3',...extra};
+}
+function jsonResponse(data,status=200) {
+  return {ok:status>=200&&status<300,status,json:async()=>structuredClone(data)};
+}
+
 test('inline packaging preserves JavaScript and CSS replacement tokens literally',async()=>{
   const root=await mkdtemp(join(tmpdir(),'relay-inline-'));
   try{
@@ -53,6 +60,7 @@ test('UI state and explicit user actions go through MCP without model calls',asy
   const calls=[];
   const api=createProtocol({fetcher:async(url,options)=>{
     calls.push({path:url.pathname,method:options.method});
+    if(url.pathname==='/api/context')return jsonResponse(serviceContext());
     return {ok:true,status:200,json:async()=>({mode:'live',collaborationMode:'independent'})};
   }});
   const result=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/actions',method:'POST',body:{action:'collaboration',mode:'independent'}}});
@@ -65,7 +73,7 @@ test('goal brief save and confirm actions pass through the private UI transport 
   const posts=[];
   const brief={objective:'目标',deliverables:'交付一份报告',acceptance:'结果与证据可核查',constraints:'限定当前工作目录',questions:''};
   const api=createProtocol({fetcher:async(url,options={})=>{
-    if(url.pathname==='/api/context')return {ok:true,status:200,json:async()=>({workspace:'C:\\work'})};
+    if(url.pathname==='/api/context')return jsonResponse(serviceContext());
     assert.equal(url.pathname,'/api/actions');assert.equal(options.method,'POST');
     const body=JSON.parse(options.body);posts.push(body);
     const goalDraft={...brief,revision:1,updatedAt:'2026-10-09T01:00:00Z',...(body.action==='confirmGoalBrief'?{confirmedAt:'2026-10-09T01:01:00Z'}:{})};
@@ -81,11 +89,150 @@ test('goal brief save and confirm actions pass through the private UI transport 
   assert.equal(posts.some(body=>['start','review','cooperativeGoal'].includes(body.action)),false);
 });
 
-test('0.5.2 resource registration retains 0.5.1 and earlier aliases and uses current inline bundle bytes',async()=>{
+test('reachable unrelated, legacy and incompatible services never receive actions or trigger startup',async()=>{
+  const cases=[
+    {context:serviceContext({service:'unrelated-service'}),error:/不是 Relay/},
+    {context:{workspace:'C:\\old-project',version:'0.5.2'},error:/旧版.*重启/},
+    {context:serviceContext({protocolVersion:2}),error:/协议不兼容/},
+    {context:serviceContext({protocolVersion:'1'}),error:/协议不兼容/},
+    {context:serviceContext({workspace:null}),error:/上下文无效/},
+    {context:{status:'ok',private:'PRIVATE_RESPONSE'},error:/不是 Relay/},
+    {status:404,context:{error:'PRIVATE_RESPONSE'},error:/无法确认/},
+    {brokenJson:true,error:/上下文无法读取/},
+  ];
+  for(const scenario of cases){
+    const calls=[];let starts=0;
+    const api=createProtocol({startService:async()=>{starts++;},fetcher:async(url,options={})=>{
+      calls.push({path:url.pathname,method:options.method||'GET'});
+      assert.equal(url.pathname,'/api/context');
+      if(scenario.brokenJson)return {ok:true,status:200,json:async()=>{throw new Error('PRIVATE_BODY_ERROR');}};
+      return jsonResponse(scenario.context,scenario.status||200);
+    }});
+    const result=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/actions',method:'POST',body:{action:'message',agentId:'worker',text:'PRIVATE_TASK'}}});
+    assert.equal(result.isError,true);assert.equal(result.structuredContent.status,503);
+    assert.match(result.structuredContent.error,scenario.error);
+    assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
+    assert.equal(starts,0);assert.deepEqual(calls,[{path:'/api/context',method:'GET'}]);
+  }
+});
+
+test('team tools refuse an unrelated service before reading team state or delegating',async()=>{
+  for(const name of ['agent_team_status','delegate_agent_task']){
+    const calls=[];let starts=0;
+    const api=createProtocol({startService:async()=>{starts++;},fetcher:async url=>{
+      calls.push(url.pathname);return jsonResponse({status:'ok'});
+    }});
+    await assert.rejects(api.handle('tools/call',{name,arguments:name==='delegate_agent_task'?{agentId:'worker',task:'任务',criteria:['验收']}:{}}),/不是 Relay/);
+    assert.deepEqual(calls,['/api/context']);assert.equal(starts,0);
+  }
+});
+
+test('each completed request rechecks service identity while compatible release versions remain usable',async()=>{
+  let context=serviceContext({version:'0.6.0'}),starts=0;
+  const calls=[];
+  const api=createProtocol({startService:async()=>{starts++;},fetcher:async(url,options={})=>{
+    calls.push({path:url.pathname,method:options.method||'GET'});
+    if(url.pathname==='/api/context')return jsonResponse(context);
+    return jsonResponse({mode:'demo'});
+  }});
+  const first=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/state'}});
+  assert.equal(first.structuredContent.ok,true);
+  context={status:'different-service'};
+  const second=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/actions',method:'POST',body:{action:'message'}}});
+  assert.equal(second.structuredContent.ok,false);assert.match(second.structuredContent.error,/不是 Relay/);
+  assert.deepEqual(calls.map(call=>call.path),['/api/context','/api/state','/api/context']);assert.equal(starts,0);
+});
+
+test('offline startup uses only the verified loopback destination and waits for its identity',async()=>{
+  let online=false,starts=0,waited=0;
+  const calls=[];
+  const api=createProtocol({apiBase:'http://localhost:4329',sleep:async ms=>{waited+=ms;},startService:async({base})=>{
+    starts++;assert.equal(base.hostname,'localhost');assert.equal(base.port,'4329');online=true;
+  },fetcher:async(url,options={})=>{
+    calls.push({path:url.pathname,method:options.method||'GET'});
+    assert.equal(url.origin,'http://localhost:4329');
+    if(url.pathname==='/api/context'){
+      if(!online)throw new Error('PRIVATE_CONNECTION_ERROR');
+      return jsonResponse(serviceContext());
+    }
+    assert.equal(url.pathname,'/api/state');return jsonResponse({mode:'demo'});
+  }});
+  const result=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/state'}});
+  assert.equal(result.structuredContent.ok,true);assert.equal(starts,1);assert.equal(waited,500);
+  assert.deepEqual(calls.map(call=>call.path),['/api/context','/api/context','/api/state']);
+  for(const apiBase of ['https://localhost:4318','http://example.com:4318','http://user:pass@localhost:4318','http://127.0.0.1:4318/api']){
+    assert.throws(()=>createProtocol({apiBase}),/本机 HTTP 服务地址/);
+  }
+});
+
+test('concurrent requests share the initial slow probe and launch only one local service',async()=>{
+  let rejectProbe;
+  const probeGate=new Promise((resolve,reject)=>{rejectProbe=reject;});
+  let contextCalls=0,starts=0,stateCalls=0,online=false;
+  const api=createProtocol({sleep:async()=>{},startService:async()=>{starts++;online=true;},fetcher:async url=>{
+    if(url.pathname==='/api/context'){
+      contextCalls++;
+      if(contextCalls===1)await probeGate;
+      assert.equal(online,true);return jsonResponse(serviceContext());
+    }
+    assert.equal(url.pathname,'/api/state');stateCalls++;return jsonResponse({mode:'demo'});
+  }});
+  const request=()=>api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/state'}});
+  const first=request(),second=request();
+  assert.equal(contextCalls,1);assert.equal(starts,0);
+  rejectProbe(new Error('PRIVATE_OFFLINE_ERROR'));
+  const results=await Promise.all([first,second]);
+  assert.equal(results.every(result=>result.structuredContent.ok),true);
+  assert.equal(contextCalls,2);assert.equal(starts,1);assert.equal(stateCalls,2);
+});
+
+test('failed startup has a safe diagnostic and clears the shared attempt so a later request can retry',async()=>{
+  let starts=0,online=false;
+  const api=createProtocol({sleep:async()=>{},startService:async()=>{
+    starts++;
+    if(starts===1)throw new Error('PRIVATE_SPAWN_ERROR');
+    online=true;
+  },fetcher:async url=>{
+    if(url.pathname==='/api/context'){
+      if(!online)throw new Error('PRIVATE_FETCH_ERROR');
+      return jsonResponse(serviceContext());
+    }
+    return jsonResponse({mode:'demo'});
+  }});
+  const request=()=>api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/state'}});
+  const failed=await request();
+  assert.equal(failed.isError,true);assert.match(failed.structuredContent.error,/无法启动/);
+  assert.equal(JSON.stringify(failed).includes('PRIVATE_'),false);
+  const retried=await request();
+  assert.equal(retried.structuredContent.ok,true);assert.equal(starts,2);
+});
+
+test('startup polling is bounded and never forwards a task without a verified service',async()=>{
+  let starts=0,probes=0,waited=0;
+  const api=createProtocol({sleep:async ms=>{waited+=ms;},startService:async()=>{starts++;},fetcher:async url=>{
+    assert.equal(url.pathname,'/api/context');probes++;throw new Error('PRIVATE_OFFLINE_ERROR');
+  }});
+  const result=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/actions',method:'POST',body:{action:'message'}}});
+  assert.equal(result.isError,true);assert.match(result.structuredContent.error,/启动后未能就绪/);
+  assert.equal(starts,1);assert.equal(probes,16);assert.equal(waited,7500);
+  assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
+});
+
+test('request failures after identity verification keep upstream details private',async()=>{
+  const api=createProtocol({fetcher:async url=>{
+    if(url.pathname==='/api/context')return jsonResponse(serviceContext());
+    throw new Error('PRIVATE_UPSTREAM_CREDENTIAL');
+  }});
+  const result=await api.handle('tools/call',{name:'relay_request',arguments:{route:'/api/state'}});
+  assert.equal(result.isError,true);assert.match(result.structuredContent.error,/无法连接/);
+  assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
+});
+
+test('0.5.3 resource registration retains 0.5.2 and earlier aliases and uses current inline bundle bytes',async()=>{
   const api=createProtocol({fetcher:async()=>{throw new Error('resource must not make a service or model request')}});
   const resources=(await api.handle('resources/list')).resources;
-  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel']);
-  for(const uri of ['ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
+  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.5.3/workspace','ui://relay/v0.5.3/panel']);
+  for(const uri of ['ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel','ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
     const result=await api.handle('resources/read',{uri});
     assert.equal(result.contents[0].uri,uri);
     assert.ok(result.contents[0].text.includes('window.__RELAY_NATIVE__=true;'));
@@ -137,7 +284,7 @@ function teamFixture({initial=teamState(),onPoll,onPost,contextDelayMs=0,postDel
     const body=options.body?JSON.parse(options.body):undefined;
     calls.push({path:url.pathname,method,body});
     assert.equal(url.hostname,'127.0.0.1');
-    if(url.pathname==='/api/context'){clock+=contextDelayMs;return response({workspace:'C:\\work\\shared',private:'PRIVATE_CONTEXT'});}
+    if(url.pathname==='/api/context'){clock+=contextDelayMs;return response(serviceContext({workspace:'C:\\work\\shared',private:'PRIVATE_CONTEXT'}));}
     if(url.pathname==='/api/state'){
       reads++;
       if(onPoll&&posts) {
@@ -176,10 +323,10 @@ function finishWorker(state,output='PUBLIC_WORKER_RESULT') {
 }
 const delegation={agentId:'worker',task:'整理实际产物并报告检查',criteria:['产物位置明确','检查结果可验证']};
 
-test('native delegation tools are model-visible at 0.5.2 without exposing arbitrary routes',async()=>{
+test('native delegation tools are model-visible at 0.5.3 without exposing arbitrary routes',async()=>{
   const fixture=teamFixture();
   const init=await fixture.api.handle('initialize');
-  assert.equal(init.serverInfo.version,'0.5.2');
+  assert.equal(init.serverInfo.version,'0.5.3');
   const status=tools.find(tool=>tool.name==='agent_team_status');
   const delegate=tools.find(tool=>tool.name==='delegate_agent_task');
   assert.equal(status.annotations.readOnlyHint,true);

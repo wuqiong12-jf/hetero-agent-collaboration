@@ -203,15 +203,21 @@ export class Orchestrator {
     return operation;
   }
 
+  // Async preflight and saving may finish after close has cancelled execution.
+  // Recheck before publishing an action's state or reserving new work.
+  _assertOpen() { if (this.closed) throw new ActionError('协作服务已关闭', 503); }
+
   async _handleAction(payload) {
-    if (this.closed) throw new ActionError('协作服务已关闭', 503);
+    this._assertOpen();
     if (!payload || typeof payload.action !== 'string') throw new ActionError('缺少 action');
     const confirmation = payload.action === 'confirmGoalBrief' ? this._goalConfirmation(payload) : undefined;
     if (confirmation?.alreadyConfirmed) return this.getState();
     if (['start', 'resume', 'review', 'retry', 'cooperativeGoal', 'confirmGoalBrief', 'message'].includes(payload.action) && (this.state.pendingCleanup.length || [...this.retiringRuns.values()].some((run) => run.cleanupFailed))) throw new ActionError('无法确认旧模型进程已停止，工作空间锁仍保留；请先由适配器确认相关进程已退出', 503);
     if (['start', 'resume', 'retry', 'review', 'cooperativeGoal', 'confirmGoalBrief'].includes(payload.action)) this._requireCooperation();
     if (this.persistenceFailure && (['start', 'resume', 'retry', 'review', 'cooperativeGoal', 'confirmGoalBrief'].includes(payload.action) || (payload.action === 'message' && this.state.mode === 'live'))) {
-      if (!await this.flushPersistence({ retry: true })) throw new ActionError(this.persistenceFailure, 503);
+      const saved = await this.flushPersistence({ retry: true });
+      this._assertOpen();
+      if (!saved) throw new ActionError(this.persistenceFailure, 503);
     }
     switch (payload.action) {
       case 'saveGoalBrief': {
@@ -223,7 +229,9 @@ export class Orchestrator {
         this.state.goalDraft = { ...fields, revision: current + 1, updatedAt: now() };
         this._activity('goal-brief-save', `任务委托书草稿 v${current + 1} 已更新；当前工作和调用预算保持不变。`);
         this._emit();
-        if (!await this.flushPersistence({ retry: true })) throw new ActionError('任务委托书草稿尚未保存到磁盘，请解除文件占用后重试；内存中的草稿已保留', 503);
+        const saved = await this.flushPersistence({ retry: true });
+        this._assertOpen();
+        if (!saved) throw new ActionError('任务委托书草稿尚未保存到磁盘，请解除文件占用后重试；内存中的草稿已保留', 503);
         break;
       }
       case 'confirmGoalBrief': {
@@ -252,6 +260,7 @@ export class Orchestrator {
         if (!this.state.goal.trim()) throw new ActionError('请先填写目标');
         if (this.state.mode === 'live') {
           await this._requireTeamCapabilities();
+          this._assertOpen();
         }
         if (this.state.tasks.length && this.state.tasks.every((task) => task.status === 'accepted')) {
           this.state.phase = 'completed'; this._emit(); return this.getState();
@@ -267,7 +276,9 @@ export class Orchestrator {
         this._emit(); break;
       }
       case 'retrySave': {
-        if (!await this.flushPersistence({ retry: true })) throw new ActionError('状态仍未保存，请先检查文件占用与目录权限。没有启动模型任务。', 503);
+        const saved = await this.flushPersistence({ retry: true });
+        this._assertOpen();
+        if (!saved) throw new ActionError('状态仍未保存，请先检查文件占用与目录权限。没有启动模型任务。', 503);
         this._enforceBlockingState();
         break;
       }
@@ -404,6 +415,7 @@ export class Orchestrator {
         if (this.state.mode === 'live' && this._agentBusy(agent.id)) throw new ActionError('这个智能体正在执行任务，请稍后发送消息', 409);
         if (this.state.mode === 'live') {
           const capabilities = await this.getCapabilities();
+          this._assertOpen();
           this._assertMessageExpectation(payload);
           const capability = agent.provider === 'codex' ? capabilities.codex : capabilities.harness;
           if (!capability?.available) {
@@ -434,6 +446,7 @@ export class Orchestrator {
       case 'agentAdd': {
         if (this.state.agents.length >= 8) throw new ActionError('团队最多支持 8 个智能体', 409);
         const agent = await this._configuredAgent(payload.agent, undefined);
+        this._assertOpen();
         if (this.state.agents.some(item => item.name.toLocaleLowerCase() === agent.name.toLocaleLowerCase())) throw new ActionError('团队中已有同名智能体，请使用不同名称以区分实例', 409);
         agent.id = id('agent'); agent.status = 'idle';
         this.state.agents.push(agent);
@@ -446,6 +459,7 @@ export class Orchestrator {
         const agent = this._chatAgent(payload.agentId);
         const patch = payload.action === 'model' ? { modelId: payload.model } : payload.agent;
         const next = await this._configuredAgent(patch, agent);
+        this._assertOpen();
         if (this.state.agents.some(item => item.id !== agent.id && item.name.toLocaleLowerCase() === next.name.toLocaleLowerCase())) throw new ActionError('团队中已有同名智能体，请使用不同名称以区分实例', 409);
         const identityChanged = ['provider', 'modelId', 'reasoningEffort', 'accessMode'].some((key) => next[key] !== agent[key]);
         if (identityChanged && this._configurationBusy(agent.id)) throw new ActionError('智能体正在生成回复或持有运行中的合作任务，暂时不能更改提供方、模型、思考强度或访问权限', 409);
@@ -484,6 +498,7 @@ export class Orchestrator {
       }
       default: throw new ActionError(`不支持的 action：${payload.action}`);
     }
+    this._assertOpen();
     return this.getState();
   }
 
@@ -626,7 +641,8 @@ export class Orchestrator {
       let catalog;
       if (typeof this.providers.getModels === 'function') {
         try { catalog = await this.providers.getModels({ provider: next.provider }); }
-        catch { throw new ActionError('当前提供方模型目录无法读取，请稍后重试', 409); }
+        catch { this._assertOpen(); throw new ActionError('当前提供方模型目录无法读取，请稍后重试', 409); }
+        this._assertOpen();
       }
       const models = Array.isArray(catalog?.models) ? catalog.models : [];
       const selected = next.modelId ? models.find((model) => model.id === next.modelId) : models.find((model) => model.isDefault);
@@ -637,6 +653,7 @@ export class Orchestrator {
   }
   async _requireTeamCapabilities({ planning = !this.state.tasks.length } = {}) {
     const capabilities = await this.getCapabilities();
+    this._assertOpen();
     this.providerAvailability = { codex: capabilities.codex?.available === true, deepseek: capabilities.harness?.available === true };
     const participants = [this._leader(), ...(planning ? [] : this.state.tasks.filter((task) => !['accepted', 'cancelled'].includes(task.status)).map((task) => this.state.agents.find((agent) => agent.id === task.agentId)))];
     if (participants.some((agent) => !agent)) throw new ActionError('任务引用了已不存在的智能体，请重建任务计划', 409);
