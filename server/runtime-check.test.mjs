@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -140,17 +140,21 @@ print(json.dumps(inspect_runtime(payload['launch'], platform='win32')))
   assert.equal(JSON.stringify(permissionDenied).includes('private-user-folder'), false);
 });
 
-function fakeSdk(root, carrier) {
+function fakeSdk(root, carrier, { supportsDshBin = true } = {}) {
+  const policyDirectory = join(root, 'synthetic-policy-directory');
+  mkdirSync(policyDirectory);
   writeFileSync(join(root, 'deepseek_harness.py'), `
-import os
+import json, os
 from dataclasses import dataclass
 from pathlib import Path
 @dataclass
 class DeepSeekHarnessConfig:
     reasoning_effort: str | None = None
+    ${supportsDshBin ? 'dsh_bin: str | None = None' : '# Synthetic old SDK has no public dsh_bin field.'}
 class DeepSeekHarness:
     def __init__(self, **kwargs):
-        Path(os.environ['CONSTRUCTOR_MARKER']).write_text('constructed')
+        captured = {**kwargs, 'policy': Path(kwargs['patches'][0]).read_text(encoding='utf-8')}
+        Path(os.environ['CONSTRUCTOR_MARKER']).write_text(json.dumps(captured), encoding='utf-8')
         raise RuntimeError('synthetic constructor stop; no model call')
     def run(self, *args, **kwargs):
         Path(os.environ['RUN_MARKER']).write_text('run called')
@@ -158,7 +162,11 @@ class DeepSeekHarness:
 `);
   writeFileSync(join(root, 'deepseek_harness_runtime.py'), `
 import os
+from pathlib import Path
 def resolve_bundled_launch_args():
+    Path(os.environ['RESOLVER_MARKER']).write_text('resolved', encoding='utf-8')
+    if os.environ.get('BUNDLED_FORBIDDEN') == '1':
+        raise AssertionError('bundled runtime resolver must not be used for override')
     return (os.environ['FIXTURE_RUNTIME'],)
 `);
   for (const name of ['deepseek_harness_sdk', 'deepseek_harness_runtime_bin']) {
@@ -171,6 +179,9 @@ def resolve_bundled_launch_args():
     DEEPSEEK_API_KEY: 'synthetic-fixture-key',
     CONSTRUCTOR_MARKER: join(root, 'constructor-marker'),
     RUN_MARKER: join(root, 'run-marker'),
+    RESOLVER_MARKER: join(root, 'resolver-marker'),
+    POLICY_DIRECTORY: policyDirectory,
+    POLICY_TEMP_MARKER: join(root, 'policy-temp-marker'),
   };
 }
 
@@ -179,9 +190,32 @@ import json, sys
 import harness_runtime
 payload = json.load(sys.stdin)
 original_inspect = harness_runtime.inspect_runtime
-harness_runtime.inspect_runtime = lambda launch: original_inspect(launch, platform='win32',
-                                                                known_bad_fingerprints=payload['fingerprints'])
+checked_launches = []
+harness_runtime.inspect_runtime = lambda launch: (checked_launches.append(list(launch)) or
+    original_inspect(launch, platform='win32', known_bad_fingerprints=payload['fingerprints']))
 import harness_bridge
+# Confined Windows test accounts can read fixture files but cannot resolve
+# ancestors of the temporary directory in strict mode. Only this synthetic
+# workspace bypasses that OS restriction; runtime selection remains unchanged.
+original_resolve = harness_bridge.Path.resolve
+def fixture_resolve(path, *args, **kwargs):
+    if kwargs.get('strict') and str(path) == payload.get('run', {}).get('workspace'):
+        return original_resolve(path)
+    return original_resolve(path, *args, **kwargs)
+harness_bridge.Path.resolve = fixture_resolve
+# Use a Node-prepared fixture directory for policy writes. Windows restricted
+# tokens can deny a Python-created directory's descendants; this unit test
+# checks the policy and public constructor arguments rather than OS ACLs.
+class FixturePolicyDirectory:
+    def __init__(self, *, prefix, dir):
+        assert prefix == 'relay-harness-policy-'
+        assert str(dir) == payload['run']['home']
+        harness_bridge.Path(harness_bridge.os.environ['POLICY_TEMP_MARKER']).write_text('entered', encoding='utf-8')
+    def __enter__(self):
+        return harness_bridge.os.environ['POLICY_DIRECTORY']
+    def __exit__(self, *args):
+        return False
+harness_bridge.tempfile.TemporaryDirectory = FixturePolicyDirectory
 `;
 
 test('bridge probe distinguishes installed SDK/runtime from blocked execution readiness', t => {
@@ -196,11 +230,13 @@ test('bridge probe distinguishes installed SDK/runtime from blocked execution re
   assert.equal(result.runtime, true);
   assert.equal(result.sdkVersion, '0.1.5rc1');
   assert.equal(result.runtimeVersion, '0.1.5rc1');
+  assert.equal(result.runtimeSource, 'bundled');
   assert.equal(result.executionReady, false);
   assert.equal(result.runtimeCheck, 'blocked');
   assert.equal(result.runtimeIssue, 'windows-acl-entry-missing');
   assert.equal(existsSync(env.CONSTRUCTOR_MARKER), false);
   assert.equal(existsSync(env.RUN_MARKER), false);
+  assert.equal(existsSync(env.POLICY_TEMP_MARKER), false);
 
   writeFileSync(carrier, 'changed unknown runtime');
   const changed = pythonJson(root, `${bridgeSetup}\nharness_bridge.probe()\n`, { fingerprints: fingerprint(content) }, env);
@@ -252,4 +288,239 @@ except RuntimeError as error:
   assert.equal(existsSync(env.CONSTRUCTOR_MARKER), false);
   assert.equal(existsSync(env.RUN_MARKER), false);
   assert.equal(existsSync(home), false);
+});
+
+const probeAndRun = `${bridgeSetup}
+if 'override' in payload:
+    # Native process environments cannot contain NUL. A synthetic mapping
+    # exercises rejection without ever giving that value to process launch.
+    harness_bridge.os.environ = {**harness_bridge.os.environ, 'RELAY_HARNESS_BIN': payload['override']}
+probe_output = []
+harness_bridge.emit = probe_output.append
+harness_bridge.probe()
+try:
+    harness_bridge.run(payload['run'])
+except RuntimeError as error:
+    result = {'probe': probe_output[0], 'error': harness_bridge.scrub(error)}
+    if 'expectedRuntime' in payload:
+        expected = str(harness_bridge.Path(payload['expectedRuntime']).resolve())
+        result['sameCheckedCarrier'] = checked_launches == [[expected], [expected]]
+    print(json.dumps(result))
+`;
+
+function assertNoRuntimeSideEffects(env, home) {
+  assert.equal(existsSync(env.RESOLVER_MARKER), false, 'invalid override must never fall back to bundled');
+  assert.equal(existsSync(env.CONSTRUCTOR_MARKER), false);
+  assert.equal(existsSync(env.RUN_MARKER), false);
+  assert.equal(existsSync(env.POLICY_TEMP_MARKER), false);
+  assert.equal(existsSync(home), false);
+}
+
+test('override probe and run select the same checked carrier through the public dsh_bin parameter', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'private-runtime-folder', 'local Harness.EXE');
+  mkdirSync(dirname(carrier));
+  writeFileSync(carrier, 'synthetic override carrier; never execute');
+  // The default carrier is deliberately absent, and resolving it is forbidden.
+  const env = { ...fakeSdk(root, join(root, 'missing-bundled-runtime.exe')),
+    RELAY_HARNESS_BIN: `  ${carrier}  `, BUNDLED_FORBIDDEN: '1' };
+  const home = join(root, 'isolated-home');
+  const result = pythonJson(root, probeAndRun,
+    { fingerprints: {}, expectedRuntime: carrier,
+      run: { workspace: root, home, prompt: 'synthetic', accessMode: 'read-only', reasoningEffort: 'high' } }, env);
+  assert.equal(result.probe.sdk, true);
+  assert.equal(result.probe.runtime, true);
+  assert.equal(result.probe.runtimeSource, 'override');
+  assert.equal(result.probe.bundledRuntimeVersion, '0.1.5rc1');
+  assert.equal(result.probe.runtimeVersion, undefined);
+  assert.equal(result.probe.runtimeCheck, 'unverified');
+  assert.equal(result.probe.executionReady, true);
+  assert.equal(result.sameCheckedCarrier, true);
+  assert.equal(JSON.stringify(result.probe).includes(root), false);
+  assert.match(result.error, /synthetic constructor stop/);
+  const options = JSON.parse(readFileSync(env.CONSTRUCTOR_MARKER, 'utf8'));
+  assert.equal(options.dsh_bin, resolve(carrier));
+  assert.equal('_launch_args' in options, false);
+  assert.equal(options.profile, 'sdk');
+  assert.equal(options.reasoning_effort, 'high');
+  assert.deepEqual(options.env, { DSH_PERMISSION_MODE: 'read-only', DSH_MAX_TOKENS_AS_SUCCESS: 'false' });
+  assert.match(options.policy, /mode: read-only/);
+  assert.match(options.policy, /policy: never/);
+  assert.match(options.policy, /sandbox: read-only\n        approval: never/);
+  assert.equal(existsSync(env.RESOLVER_MARKER), false);
+  assert.equal(existsSync(env.RUN_MARKER), false);
+});
+
+test('override probe reads files only and neither constructs SDK nor executes its selected file', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'read-only-probe.exe');
+  writeFileSync(carrier, 'synthetic file that cannot be executed');
+  const env = { ...fakeSdk(root, join(root, 'missing-bundled-runtime.exe')),
+    RELAY_HARNESS_BIN: carrier, BUNDLED_FORBIDDEN: '1' };
+  const result = pythonJson(root, `${bridgeSetup}\nharness_bridge.probe()\n`, { fingerprints: {} }, env);
+  assert.equal(result.runtimeSource, 'override');
+  assert.equal(result.executionReady, true);
+  assertNoRuntimeSideEffects(env, join(root, 'home-not-created'));
+});
+
+test('known bad override is blocked before constructor, run, home or bundled fallback', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'private-known-bad.exe');
+  const content = 'synthetic known broken override';
+  writeFileSync(carrier, content);
+  const env = { ...fakeSdk(root, join(root, 'missing-bundled-runtime.exe')), RELAY_HARNESS_BIN: carrier };
+  const home = join(root, 'must-not-create-home');
+  const result = pythonJson(root, probeAndRun,
+    { fingerprints: fingerprint(content), run: { workspace: root, home, prompt: 'synthetic' } }, env);
+  assert.equal(result.probe.sdk, true);
+  assert.equal(result.probe.runtime, true);
+  assert.equal(result.probe.runtimeSource, 'override');
+  assert.equal(result.probe.runtimeCheck, 'blocked');
+  assert.equal(result.probe.executionReady, false);
+  assert.match(result.error, /Windows Harness.*ACL.*启动检查未通过/);
+  assert.equal(JSON.stringify(result).includes(root), false);
+  assertNoRuntimeSideEffects(env, home);
+});
+
+test('override is rechecked when its carrier changes after probe and before run', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'local-runtime.exe');
+  const badContent = 'synthetic newly broken override';
+  writeFileSync(carrier, 'synthetic previously unknown override');
+  const env = { ...fakeSdk(root, join(root, 'missing-bundled-runtime.exe')), RELAY_HARNESS_BIN: carrier };
+  const home = join(root, 'must-not-create-home');
+  const result = pythonJson(root, `${bridgeSetup}
+from pathlib import Path
+probe_output = []
+harness_bridge.emit = probe_output.append
+harness_bridge.probe()
+Path(payload['carrier']).write_text(payload['badContent'], encoding='utf-8')
+try:
+    harness_bridge.run(payload['run'])
+except RuntimeError as error:
+    print(json.dumps({'probe': probe_output[0], 'error': str(error)}))
+`, { fingerprints: fingerprint(badContent), carrier, badContent,
+    run: { workspace: root, home, prompt: 'synthetic' } }, env);
+  assert.equal(result.probe.executionReady, true);
+  assert.match(result.error, /Windows Harness.*ACL.*启动检查未通过/);
+  assertNoRuntimeSideEffects(env, home);
+});
+
+test('empty, relative, quoted, script, command, missing and directory overrides fail closed without exposing paths', t => {
+  const root = fixture(t);
+  const bundled = join(root, 'good-bundled.exe');
+  const carrier = join(root, 'private-carrier.exe');
+  const script = join(root, 'private-script.py');
+  const shebang = join(root, 'private-script-disguised.exe');
+  const directory = join(root, 'private-directory.exe');
+  writeFileSync(bundled, 'synthetic good bundled carrier');
+  writeFileSync(carrier, 'synthetic normal carrier');
+  writeFileSync(script, 'synthetic script; never execute');
+  writeFileSync(shebang, '#!/bin/sh\nnever execute');
+  mkdirSync(directory);
+  const env = fakeSdk(root, bundled);
+  const home = join(root, 'must-not-create-home');
+  const invalid = ['', '  ', 'relative-runtime.exe', `${carrier}\n`, `${carrier}\u2028`, `${carrier}\0`,
+    `"${carrier}"`, `${carrier} --flag`, `node ${script}`, script, shebang, directory,
+    join(root, 'private-user-folder', 'missing-runtime.exe')];
+  if (process.platform === 'win32') invalid.push('C:relative.exe', '\\root-relative.exe', join(root, 'private-runtime.bin'));
+  for (const value of invalid) {
+    const result = pythonJson(root, probeAndRun,
+      { fingerprints: {}, override: value, run: { workspace: root, home, prompt: 'synthetic' } }, env);
+    assert.equal(result.probe.sdk, true);
+    assert.equal(result.probe.runtime, false);
+    assert.equal(result.probe.runtimeSource, 'override');
+    assert.equal(result.probe.runtimeCheck, 'failed');
+    assert.equal(result.probe.executionReady, false);
+    assert.equal(JSON.stringify(result).includes(root), false);
+    assert.equal(JSON.stringify(result).includes('private-'), false);
+    assertNoRuntimeSideEffects(env, home);
+  }
+});
+
+test('read failure of override remains a safe failure before home or SDK construction', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'private-runtime.exe');
+  writeFileSync(carrier, 'synthetic readable carrier until access fails');
+  const env = { ...fakeSdk(root, carrier), RELAY_HARNESS_BIN: carrier };
+  const home = join(root, 'must-not-create-home');
+  const result = pythonJson(root, `${bridgeSetup}
+import builtins
+def denied(*args, **kwargs):
+    raise PermissionError('private-runtime.exe synthetic access denied')
+builtins.open = denied
+probe_output = []
+harness_bridge.emit = probe_output.append
+harness_bridge.probe()
+try:
+    harness_bridge.run(payload['run'])
+except RuntimeError as error:
+    print(json.dumps({'probe': probe_output[0], 'error': str(error)}))
+`, { fingerprints: {}, run: { workspace: root, home, prompt: 'synthetic' } }, env);
+  assert.equal(result.probe.executionReady, false);
+  assert.equal(result.probe.runtimeCheck, 'failed');
+  assert.match(result.error, /无法读取 Harness 运行时文件/);
+  assert.equal(JSON.stringify(result).includes(root), false);
+  assert.equal(JSON.stringify(result).includes('private-runtime'), false);
+  assertNoRuntimeSideEffects(env, home);
+});
+
+test('old SDK rejects override capability for both probe and run but keeps the default bundled path', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'override.exe');
+  writeFileSync(carrier, 'synthetic selected carrier');
+  const env = fakeSdk(root, carrier, { supportsDshBin: false });
+  const home = join(root, 'must-not-create-home');
+  const result = pythonJson(root, probeAndRun,
+    { fingerprints: {}, run: { workspace: root, home, prompt: 'synthetic' } }, { ...env, RELAY_HARNESS_BIN: carrier });
+  assert.equal(result.probe.sdk, true);
+  assert.equal(result.probe.runtimeSource, 'override');
+  assert.equal(result.probe.executionReady, false);
+  assert.match(result.probe.detail, /does not support dsh_bin/);
+  assert.match(result.error, /does not support dsh_bin/);
+  assertNoRuntimeSideEffects(env, home);
+  const bundled = pythonJson(root, `${bridgeSetup}\nharness_bridge.probe()\n`, { fingerprints: {} }, env);
+  assert.equal(bundled.runtimeSource, 'bundled');
+  assert.equal(bundled.executionReady, true);
+  const defaultRun = pythonJson(root, `${bridgeSetup}
+try:
+    harness_bridge.run(payload['run'])
+except RuntimeError as error:
+    print(json.dumps({'error': str(error)}))
+`, { fingerprints: {}, run: { workspace: root, home, prompt: 'synthetic' } }, env);
+  assert.match(defaultRun.error, /synthetic constructor stop/);
+  const options = JSON.parse(readFileSync(env.CONSTRUCTOR_MARKER, 'utf8'));
+  assert.equal('dsh_bin' in options, false, 'default SDK keeps its official bundled resolver');
+  assert.equal('_launch_args' in options, false);
+  assert.equal(existsSync(env.RUN_MARKER), false);
+});
+
+test('runtime launch errors redact raw, normalized and Windows escaped override paths', t => {
+  const root = fixture(t);
+  const carrier = join(root, 'private-runtime.exe');
+  const windowsPath = 'C:\\private-user\\local runtime.exe';
+  const result = pythonJson(root, `
+import json, os, sys
+from pathlib import Path
+import harness_bridge
+payload = json.load(sys.stdin)
+checks = []
+for value in payload['paths']:
+    os.environ['RELAY_HARNESS_BIN'] = value
+    normalized = str(Path(value.strip()).resolve())
+    message = f'launch failed: {value} {normalized} {value!r} {json.dumps(value)}'
+    checks.append(harness_bridge.scrub(message))
+# Simulate a link retargeted after carrier selection. Launch errors from the
+# previously selected target must stay redacted even if normalization changes.
+old_target = str(Path(payload['paths'][0]).resolve())
+harness_bridge._selected_runtime_paths.add(old_target)
+os.environ['RELAY_HARNESS_BIN'] = payload['paths'][1]
+checks.append(harness_bridge.scrub(f'launch failed: {old_target!r}'))
+print(json.dumps(checks))
+`, { paths: [carrier, windowsPath] });
+  for (const detail of result) {
+    assert.equal(detail.includes('private-'), false);
+    assert.equal(detail.includes(root), false);
+    assert.match(detail, /runtime path redacted/);
+  }
 });

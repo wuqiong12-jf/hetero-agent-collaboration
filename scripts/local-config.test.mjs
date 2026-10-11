@@ -20,9 +20,9 @@ function fakeRead(files, requested = []) {
 }
 
 test('existing environment values take priority and skip all secret file reads and decryption', async () => {
-  const env = { RELAY_PYTHON: 'existing-python', RELAY_DEEPSEEK_MODEL: 'existing-model', RELAY_HARNESS_SOURCE: 'existing-source', DEEPSEEK_API_KEY: 'EXISTING_TEST_KEY' };
+  const env = { RELAY_PYTHON: 'existing-python', RELAY_DEEPSEEK_MODEL: 'existing-model', RELAY_HARNESS_SOURCE: 'existing-source', RELAY_HARNESS_BIN: join(root, 'existing-runtime.exe'), DEEPSEEK_API_KEY: 'EXISTING_TEST_KEY' };
   const before = { ...env }; const requested = [];
-  const files = new Map([[configPath, JSON.stringify({ RELAY_PYTHON: 'different/python.exe', RELAY_DEEPSEEK_MODEL: 'deepseek-flash', RELAY_HARNESS_SOURCE: 'different/harness' })], [cipherPath, fakeCipher]]);
+  const files = new Map([[configPath, JSON.stringify({ RELAY_PYTHON: 'different/python.exe', RELAY_DEEPSEEK_MODEL: 'deepseek-flash', RELAY_HARNESS_SOURCE: 'different/harness', RELAY_HARNESS_BIN: join(root, 'different-runtime.exe') })], [cipherPath, fakeCipher]]);
   const result = await loadLocalConfig(root, { env, platform: 'linux', readFile: fakeRead(files, requested), decrypt: () => assert.fail('decryption must be skipped') });
   assert.deepEqual(env, before); assert.deepEqual(result, { configLoaded: true, keyLoaded: false });
   assert.deepEqual(requested, [configPath]);
@@ -49,6 +49,46 @@ test('absent configuration and ciphertext are optional on any platform', async (
   assert.deepEqual(await loadLocalConfig(root, { env, platform: 'linux', readFile: fakeRead(new Map()), decrypt: () => assert.fail('no file means no decrypt') }), { configLoaded: false, keyLoaded: false });
   assert.deepEqual(env, {});
   await assert.rejects(loadLocalConfig('relative-project', { env, readFile: () => assert.fail('must reject before reading') }), /绝对路径/);
+});
+
+test('Harness executable config saves a single absolute path with spaces and preserves environment priority', async () => {
+  const carrier = process.platform === 'win32' ? 'C:\\Local Harness\\runtime.EXE' : '/local Harness/runtime';
+  const platform = process.platform;
+  const env = { DEEPSEEK_API_KEY: '' };
+  const requested = [];
+  const files = new Map([[configPath, JSON.stringify({ RELAY_HARNESS_BIN: `  ${carrier}  ` })]]);
+  const result = await loadLocalConfig(root, { env, platform, readFile: fakeRead(files, requested), decrypt: () => assert.fail('must not decrypt') });
+  assert.equal(env.RELAY_HARNESS_BIN, carrier);
+  assert.deepEqual(result, { configLoaded: true, keyLoaded: false });
+  assert.deepEqual(requested, [configPath]);
+  const emptyOverride = { DEEPSEEK_API_KEY: '', RELAY_HARNESS_BIN: '' };
+  await loadLocalConfig(root, { env: emptyOverride, platform, readFile: fakeRead(files) });
+  assert.equal(emptyOverride.RELAY_HARNESS_BIN, '', 'explicit empty env must reach fail-closed runtime selection');
+  const windowsEnv = { DEEPSEEK_API_KEY: '' };
+  await loadLocalConfig(root, { env: windowsEnv, platform: 'win32', readFile: fakeRead(new Map([[configPath,
+    JSON.stringify({ RELAY_HARNESS_BIN: 'C:\\Local Harness\\runtime.EXE' })]])) });
+  assert.equal(windowsEnv.RELAY_HARNESS_BIN, 'C:\\Local Harness\\runtime.EXE');
+});
+
+test('Harness executable config rejects relative paths, Windows scripts, command strings and multiline values atomically', async () => {
+  const invalid = ['', ' ', 42, ['C:\\private\\runtime.exe'], 'relative/runtime.exe', 'C:relative.exe',
+    '\\private\\root-relative.exe', '/private/root-relative.exe', 'C:\\private\\runtime.py', 'C:\\private\\runtime.ps1',
+    'C:\\private\\runtime.cmd', 'C:\\private\\runtime.bat', 'C:\\private\\runtime.mjs',
+    '"C:\\private\\runtime.exe"', 'C:\\private\\runtime.exe --flag', 'node C:\\private\\runtime.js',
+    'C:\\private\\runtime.exe\n', 'C:\\private\\runtime.exe\r', 'C:\\private\\runtime.exe\u2028', 'C:\\private\\runtime.exe\0'];
+  for (const value of invalid) {
+    const env = { DEEPSEEK_API_KEY: 'TEST_ONLY_KEY' };
+    const before = { ...env };
+    const config = JSON.stringify({ RELAY_PYTHON: 'valid/python.exe', RELAY_HARNESS_BIN: value });
+    await assert.rejects(loadLocalConfig(root, { env, platform: 'win32', readFile: fakeRead(new Map([[configPath, config]])),
+      decrypt: () => assert.fail('invalid config must not decrypt') }), error => {
+      assert.equal(error.message.includes('private'), false);
+      return true;
+    });
+    assert.deepEqual(env, before);
+  }
+  await assert.rejects(loadLocalConfig(root, { env: { DEEPSEEK_API_KEY: '' }, platform: 'linux',
+    readFile: fakeRead(new Map([[configPath, JSON.stringify({ RELAY_HARNESS_BIN: '/private/runtime.sh' })]])) }), /不接受脚本或命令参数/);
 });
 
 test('invalid JSON, unsupported fields, bad values, and read errors fail without applying or exposing contents', async () => {

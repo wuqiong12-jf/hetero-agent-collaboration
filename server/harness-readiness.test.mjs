@@ -36,7 +36,11 @@ test('a present SDK and key cannot turn a known broken runtime green, and explic
   fixture.frame={type:'capabilities',sdk:true,runtime:true,executionReady:true,runtimeCheck:'unverified',runtimeIssue:null};
   assert.equal((await fixture.providers.getCapabilities()).harness.available,false);assert.equal(fixture.probes,1);
   const latest=await fixture.providers.getCapabilities({refresh:true});
-  assert.equal(fixture.probes,2);assert.equal(latest.harness.available,true);assert.equal(latest.harness.runtimeCheck,'unverified');assert.match(latest.harness.detail,/未做命令功能验证/);
+  assert.equal(fixture.probes,2);assert.equal(latest.harness.available,true);assert.equal(latest.harness.runtimeCheck,'unverified');assert.match(latest.harness.detail,/连接自检只检查载体文件/);
+  assert.equal(latest.harness.runtimeSource,'bundled');
+  fixture.frame={type:'capabilities',sdk:true,runtime:true,executionReady:true,runtimeCheck:'unverified',runtimeIssue:null,runtimeSource:'override'};
+  const override=await fixture.providers.getCapabilities({refresh:true});
+  assert.equal(override.harness.runtimeSource,'override');assert.match(override.harness.detail,/指定的本地运行时/);
 });
 
 test('legacy probe frames remain unverified and failed inspection never exposes probe diagnostics',async()=>{

@@ -1,8 +1,9 @@
 import { promises as filesystem } from 'node:fs';
 import { spawn as spawnProcess } from 'node:child_process';
-import { isAbsolute, join, resolve } from 'node:path';
+import { extname, isAbsolute, join, resolve, win32 } from 'node:path';
 
-const CONFIG_KEYS = new Set(['RELAY_PYTHON', 'RELAY_DEEPSEEK_MODEL', 'RELAY_HARNESS_SOURCE']);
+const CONFIG_KEYS = new Set(['RELAY_PYTHON', 'RELAY_DEEPSEEK_MODEL', 'RELAY_HARNESS_SOURCE', 'RELAY_HARNESS_BIN']);
+const SCRIPT_SUFFIXES = new Set(['.bat', '.cmd', '.ps1', '.sh', '.bash', '.zsh', '.py', '.pyw', '.js', '.mjs', '.cjs', '.ts']);
 const DECRYPT_SCRIPT = `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
@@ -31,7 +32,7 @@ async function optionalText(path, readFile, description) {
   }
 }
 
-function parseConfig(text, projectRoot) {
+function parseConfig(text, projectRoot, platform) {
   let config;
   try { config = JSON.parse(String(text).replace(/^\uFEFF/, '')); }
   catch { throw new Error('本地配置不是有效 JSON。'); }
@@ -39,10 +40,17 @@ function parseConfig(text, projectRoot) {
   const entries = [];
   for (const [key, value] of Object.entries(config)) {
     if (!CONFIG_KEYS.has(key)) throw new Error('本地配置包含不支持的字段；仅允许运行路径和模型信息。');
-    if (typeof value !== 'string' || !value.trim() || value.length > 4096 || /[\r\n\0]/.test(value)) throw new Error('本地配置字段必须为非空单行字符串。');
+    if (typeof value !== 'string' || !value.trim() || value.length > 4096 || /[\r\n\0\v\f\u0085\u2028\u2029]/.test(value)) throw new Error('本地配置字段必须为非空单行字符串。');
     const clean = value.trim();
     if (key === 'RELAY_DEEPSEEK_MODEL') {
       if (!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(clean)) throw new Error('本地配置中的模型 ID 无效。');
+      entries.push([key, clean]);
+    } else if (key === 'RELAY_HARNESS_BIN') {
+      const absolute = platform === 'win32'
+        ? win32.isAbsolute(clean) && win32.parse(clean).root !== '\\' && win32.parse(clean).root !== '/'
+        : isAbsolute(clean);
+      const suffix = (platform === 'win32' ? win32.extname(clean) : extname(clean)).toLowerCase();
+      if (!absolute || (platform === 'win32' && suffix !== '.exe') || SCRIPT_SUFFIXES.has(suffix)) throw new Error('本地配置中的 RELAY_HARNESS_BIN 必须为可执行文件的绝对路径；Windows 仅支持 .exe，不接受脚本或命令参数。');
       entries.push([key, clean]);
     } else entries.push([key, isAbsolute(clean) ? clean : resolve(projectRoot, clean)]);
   }
@@ -100,7 +108,7 @@ export async function loadLocalConfig(projectRoot, {
   if (typeof projectRoot !== 'string' || !isAbsolute(projectRoot)) throw new Error('项目根目录必须为绝对路径。');
   const root = resolve(projectRoot);
   const configText = await optionalText(join(root, '.relay', 'local-config.json'), readFile, '本地配置文件');
-  const entries = configText === undefined ? [] : parseConfig(configText, root);
+  const entries = configText === undefined ? [] : parseConfig(configText, root, platform);
   let decryptedKey;
   if (env.DEEPSEEK_API_KEY === undefined) {
     const cipherText = await optionalText(join(root, '.relay', 'secrets', 'deepseek.dpapi'), readFile, '本地密钥文件');

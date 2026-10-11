@@ -17,6 +17,73 @@ from pathlib import Path
 from harness_runtime import inspect_runtime
 
 
+class RuntimeSelectionError(RuntimeError):
+    """A safe, path-free failure while choosing a runtime carrier."""
+
+
+SCRIPT_SUFFIXES = frozenset((".bat", ".cmd", ".ps1", ".sh", ".bash", ".zsh",
+                             ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts"))
+# Redaction remembers the selected spelling even if a link changes after its
+# check. This never caches a file inspection or authorizes a later execution.
+_selected_runtime_paths: set[str] = set()
+
+
+def runtime_source() -> str:
+    # An explicitly empty override is invalid, rather than permission to fall
+    # back to a different executable.
+    return "override" if "RELAY_HARNESS_BIN" in os.environ else "bundled"
+
+
+def select_runtime(sdk) -> tuple[str, tuple[str, ...]]:
+    """Resolve the same single carrier for the probe and public SDK invocation.
+
+    An override is a file path, never a command or a list of launch arguments.
+    No selected executable is started here. Errors omit the configured path.
+    """
+    source = runtime_source()
+    if source == "bundled":
+        from deepseek_harness_runtime import resolve_bundled_launch_args
+
+        try:
+            return source, tuple(resolve_bundled_launch_args())
+        except (OSError, TypeError, ValueError):
+            return source, ()
+
+    fields = getattr(getattr(sdk, "DeepSeekHarnessConfig", None), "__dataclass_fields__", {})
+    if "dsh_bin" not in fields:
+        raise RuntimeSelectionError(
+            "Installed Harness SDK does not support dsh_bin; update the SDK to use RELAY_HARNESS_BIN.")
+    value = os.environ["RELAY_HARNESS_BIN"]
+    if not value.strip() or len(value) > 4096 or any(char in value for char in "\r\n\0\v\f\x85\u2028\u2029"):
+        raise RuntimeSelectionError("RELAY_HARNESS_BIN must be a non-empty single-line absolute executable file path.")
+    path = Path(value.strip())
+    if not path.is_absolute():
+        raise RuntimeSelectionError("RELAY_HARNESS_BIN must be an absolute executable file path, without command arguments.")
+    if sys.platform == "win32" and path.suffix.lower() != ".exe":
+        raise RuntimeSelectionError("RELAY_HARNESS_BIN must select a Windows .exe file, without scripts or command arguments.")
+    if path.suffix.lower() in SCRIPT_SUFFIXES:
+        raise RuntimeSelectionError("RELAY_HARNESS_BIN must select an executable file, without scripts or command arguments.")
+    try:
+        # Match the public SDK's path normalization. On confined Windows
+        # accounts strict resolution may deny ancestor inspection even when
+        # the selected file itself is readable; the file checks below remain
+        # mandatory and do not fall back to another runtime.
+        path = path.resolve()
+        if not path.is_file():
+            raise OSError("Not a file")
+        if (sys.platform == "win32" and path.suffix.lower() != ".exe") or path.suffix.lower() in SCRIPT_SUFFIXES:
+            raise RuntimeSelectionError("RELAY_HARNESS_BIN must select an executable file, without scripts or command arguments.")
+        with path.open("rb") as stream:
+            if stream.read(2) == b"#!":
+                raise RuntimeSelectionError("RELAY_HARNESS_BIN must select an executable file, without scripts or command arguments.")
+    except (OSError, ValueError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeSelectionError):
+            raise
+        raise RuntimeSelectionError("无法读取 RELAY_HARNESS_BIN 指定的 Harness 运行时文件，启动检查未通过；请检查文件与权限后重新检测。") from None
+    _selected_runtime_paths.add(str(path))
+    return source, (str(path),)
+
+
 def emit(value: dict) -> None:
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
@@ -27,6 +94,23 @@ def scrub(value: object) -> str:
         secret = os.environ.get(name)
         if secret:
             text = text.replace(secret, "[credential redacted]")
+    paths = set(_selected_runtime_paths)
+    override = os.environ.get("RELAY_HARNESS_BIN")
+    if override and override.strip():
+        paths.update((override, override.strip()))
+        try:
+            paths.add(str(Path(override.strip()).resolve()))
+        except (OSError, ValueError, RuntimeError):
+            pass
+    if paths:
+        # SDK/OS launch errors can quote Windows paths with escaped slashes.
+        # Redact both the configured and resolved spelling without logging it.
+        spellings = {spelling for path in paths
+                     for spelling in (path, repr(path)[1:-1],
+                                      json.dumps(path, ensure_ascii=False)[1:-1],
+                                      json.dumps(path)[1:-1])}
+        for spelling in sorted(spellings, key=len, reverse=True):
+            text = text.replace(spelling, "[runtime path redacted]")
     return text[:1000]
 
 
@@ -34,30 +118,33 @@ def probe() -> None:
     try:
         import deepseek_harness as sdk
         from deepseek_harness import DeepSeekHarness  # noqa: F401
-        from deepseek_harness_runtime import resolve_bundled_launch_args
-
         try:
-            launch = resolve_bundled_launch_args()
-        except (OSError, ValueError):
-            launch = ()
-        inspection = inspect_runtime(launch)
-        ready = bool(launch and Path(launch[0]).is_file())
+            source, launch = select_runtime(sdk)
+            inspection = inspect_runtime(launch)
+            ready = bool(launch and Path(launch[0]).is_file())
+        except RuntimeSelectionError as exc:
+            source = runtime_source()
+            ready = False
+            inspection = {"runtimeCheck": "failed", "executionReady": False,
+                          "runtimeIssue": "runtime-check-failed", "detail": str(exc)}
         config_fields = getattr(getattr(sdk, "DeepSeekHarnessConfig", None), "__dataclass_fields__", {})
         supports_effort = "reasoning_effort" in config_fields
         versions = {}
         for distribution, key in (("deepseek-harness-sdk", "sdkVersion"),
                                   ("deepseek-harness-runtime-bin", "runtimeVersion")):
             try:
-                versions[key] = importlib.metadata.version(distribution)
+                versions["bundledRuntimeVersion" if source == "override" and key == "runtimeVersion" else key] = importlib.metadata.version(distribution)
             except importlib.metadata.PackageNotFoundError:
                 pass
         emit({"type": "capabilities", "sdk": True, "runtime": ready,
+              "runtimeSource": source,
               "reasoningEffortSupported": supports_effort,
               "reasoningEfforts": ["off", "low", "high", "max"] if supports_effort else [],
               **versions,
               **inspection})
     except Exception as exc:
         emit({"type": "capabilities", "sdk": False, "runtime": False,
+              "runtimeSource": runtime_source(),
               "runtimeCheck": "failed", "executionReady": False,
               "runtimeIssue": "runtime-check-failed",
               "detail": scrub(exc)})
@@ -126,12 +213,7 @@ def run(payload: dict) -> None:
         raise RuntimeError("DEEPSEEK_API_KEY is required.")
     import deepseek_harness as sdk
     from deepseek_harness import DeepSeekHarness
-    from deepseek_harness_runtime import resolve_bundled_launch_args
-
-    try:
-        launch = resolve_bundled_launch_args()
-    except (OSError, ValueError):
-        launch = ()
+    source, launch = select_runtime(sdk)
     inspection = inspect_runtime(launch)
     if not inspection["executionReady"]:
         raise RuntimeError(inspection["detail"])
@@ -216,6 +298,7 @@ def run(payload: dict) -> None:
             request_timeout_seconds=float(payload.get("timeoutSeconds") or 1200),
             shutdown_timeout_seconds=1,
             env={"DSH_PERMISSION_MODE": access_mode, "DSH_MAX_TOKENS_AS_SUCCESS": "false"},
+            **({"dsh_bin": launch[0]} if source == "override" else {}),
             **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
         )
         with harness:
