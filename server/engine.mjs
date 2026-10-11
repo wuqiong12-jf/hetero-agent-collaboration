@@ -3,6 +3,7 @@ import { existsSync, readFileSync, promises as filesystem } from 'node:fs';
 import { dirname } from 'node:path';
 import { describeRecovery } from './recovery.mjs';
 import { createWorkspaceBinding, assertWorkspaceBinding, WorkspaceBindingError } from './workspace.mjs';
+import { prepareSettings } from './settings.mjs';
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}-${randomUUID()}`;
@@ -327,35 +328,12 @@ export class Orchestrator {
         this._activity('goal', '目标已更新，旧运行已撤销。'); this._emit(); break;
       }
       case 'settings': {
-        const settings = payload.settings;
-        if (!settings || typeof settings !== 'object') throw new ActionError('缺少 settings');
-        const next = { ...this.state.settings };
-        for (const key of ['autoReview', 'autoDispatch']) if (key in settings) {
-          if (typeof settings[key] !== 'boolean') throw new ActionError(`${key} 必须为布尔值`);
-          next[key] = settings[key];
-        }
-        for (const key of ['maxRetries', 'maxSupervisorCalls', 'maxWorkerCalls']) if (key in settings) {
-          const value = settings[key];
-          if (!Number.isInteger(value) || value < (key === 'maxRetries' ? 0 : 1) || value > (key === 'maxRetries' ? 20 : 2000)) throw new ActionError(`${key} 超出允许范围`);
-          next[key] = value;
-        }
-        if ('maxParallelReaders' in settings) {
-          const value = settings.maxParallelReaders;
-          if (!Number.isInteger(value) || value < 1 || value > 4) throw new ActionError('只读并行上限必须是 1–4 的整数');
+        let next;
+        try { next = prepareSettings(this.state.settings, payload); }
+        catch (error) { throw new ActionError(error.message, error.status ?? 400); }
+        if (Object.hasOwn(payload.settings, 'maxParallelReaders')) {
+          const value = next.maxParallelReaders;
           if (this.state.mode === 'live' && value < this._workspaceCounts().readers) throw new ActionError('请等待当前只读任务完成后再降低并行上限', 409);
-          next.maxParallelReaders = value;
-        }
-        if ('maxReviewRetries' in settings) {
-          if (!Number.isInteger(settings.maxReviewRetries) || settings.maxReviewRetries < 0 || settings.maxReviewRetries > 10) throw new ActionError('额外核查上限必须是 0–10 的整数');
-          next.maxReviewRetries = settings.maxReviewRetries;
-        }
-        if ('maxProviderCalls' in settings) {
-          if (!settings.maxProviderCalls || typeof settings.maxProviderCalls !== 'object' || Array.isArray(settings.maxProviderCalls)) throw new ActionError('maxProviderCalls 必须是提供方预算对象');
-          next.maxProviderCalls = { ...this.state.settings.maxProviderCalls };
-          for (const [provider, value] of Object.entries(settings.maxProviderCalls)) {
-            if (!PROVIDERS.has(provider) || !Number.isInteger(value) || value < 1 || value > 2000) throw new ActionError('提供方调用预算超出允许范围');
-            next.maxProviderCalls[provider] = value;
-          }
         }
         this.state.settings = next;
         this._activity('settings', '自动核查、自动派单与本轮调用预算已更新。'); this._emit(); this._queuePump(); break;

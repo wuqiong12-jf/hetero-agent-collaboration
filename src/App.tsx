@@ -4,6 +4,7 @@ import type { Agent, Capabilities, GoalBriefFields, Message, ModelCatalog, Provi
 import { nativeHost, requestJson, watchState } from './transport';
 import GoalBriefEditor from './GoalBriefEditor';
 import RecoveryPanel from './RecoveryPanel';
+import BudgetField from './BudgetField';
 
 type Dialog = 'settings' | 'history' | 'workflow' | 'team' | 'goal' | 'workspace' | null;
 type AgentForm = { name: string; provider: Provider; modelId: string; role: string; reasoningEffort: string; accessMode: 'read-only' | 'workspace-write'; hidden: boolean };
@@ -198,7 +199,13 @@ export default function App() {
     }
     setPending(old => ({ ...old, [key]: (old[key] || 0) + 1 })); setError('');
     try { const result = await requestJson<State>('/api/actions', {expectedStateId: state?.id, ...payload}); acceptState(result); return result; }
-    catch (err) { setError(err instanceof Error ? err.message : '无法连接服务'); return null; }
+    catch (err) {
+      setError(err instanceof Error ? err.message : '无法连接服务');
+      // Native panels poll less frequently than the web view. Refresh after a
+      // failed settings save so a conflict can show the server's current value.
+      if (payload.action === 'settings') { try { acceptState(await requestJson<State>('/api/state')); } catch { /* Keep the original error and local input. */ } }
+      return null;
+    }
     finally { setPending(old => ({ ...old, [key]: Math.max(0, (old[key] || 1) - 1) })); }
   };
   const action: Action = async (payload, key) => Boolean(await actionResult(payload, key));
@@ -341,20 +348,20 @@ export default function App() {
             {reviewProblems.length > 0 && <section className="review-problems" aria-label="核查待处理任务"><strong>核查未形成有效结论</strong><p className="context-note">现有交付等待核查。仅重新核查会继续检查同一份输出。</p>{reviewProblems.map(task => { const reason = reviewDisabledReason(task, state, anyPending, connected); return <article className="review-problem" key={task.id}><strong>{task.title}</strong><small>当前工作者尝试 {task.attempt} · 已启动核查 {task.reviewAttempts ?? 0}/{reviewLimit(state)} 次</small><p>{task.reviewError}</p><div className="review-problem-actions"><button className="button secondary" type="button" aria-label={'仅重新核查：' + task.title} disabled={Boolean(reason)} title={reason || '继续核查当前交付'} onClick={() => reviewAgain(task.id)}>{pending['review:' + task.id] ? <Loader2 size={12} className="spin" /> : <Check size={12} />}仅重新核查</button>{reason && <small>{reason}</small>}</div></article>; })}</section>}
             <div className="workflow-current-goal"><strong>{state.activeBrief ? '当前已确认任务 · 版本 ' + state.activeBrief.revision : '已有目标 · 旧版本任务'}</strong><p>{state.activeBrief?.objective || state.goal || '尚无执行目标'}</p><small>编写或保存新草稿不会改动当前工作。新任务须预览确认后才开始。</small><button className="button secondary" type="button" onClick={() => openGoal()}>编写任务委托书</button></div>
             <label className="workflow-field inline">监工<select aria-label="协作监工" value={leader.id} disabled={anyPending} onChange={event => action({ action: 'leader', agentId: event.target.value })}>{state.agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
-            <label className="workflow-check"><input id="workflow-setting-autoReview" type="checkbox" checked={state.settings.autoReview} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoReview: event.target.checked } })} />工作完成后自动核查</label>
-            <label className="workflow-check"><input type="checkbox" checked={state.settings.autoDispatch} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoDispatch: event.target.checked } })} />核查后继续分工</label>
+            <label className="workflow-check"><input id="workflow-setting-autoReview" type="checkbox" checked={state.settings.autoReview} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoReview: event.target.checked }, expectedSettings: { autoReview: state.settings.autoReview } })} />工作完成后自动核查</label>
+            <label className="workflow-check"><input type="checkbox" checked={state.settings.autoDispatch} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoDispatch: event.target.checked }, expectedSettings: { autoDispatch: state.settings.autoDispatch } })} />核查后继续分工</label>
             <label className="workflow-check"><input type="checkbox" checked={showWorkflow} onChange={event => setShowWorkflow(event.target.checked)} />在对话中显示本次协作输出</label>
-            <BudgetField label="同时只读智能体上限" value={state.settings.maxParallelReaders ?? 3} max={4} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxParallelReaders: value } })} />
+            <BudgetField key={state.id + ':parallel'} label="同时只读智能体上限" value={state.settings.maxParallelReaders ?? 3} max={4} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxParallelReaders: value }, expectedSettings: { maxParallelReaders: expected } })} />
             <p className="context-note">最多同时运行 1–4 个只读执行，独立聊天与合作任务共享此限额。写入执行独占目录；当前 {executionLabel(state)}。</p>
             <details className="workflow-budget" open={budgetOpen} onToggle={event => setBudgetOpen(event.currentTarget.open)}><summary>预算与返工上限</summary><div>
-              <BudgetField id="workflow-setting-maxSupervisorCalls" label="监工自动调用上限" value={state.settings.maxSupervisorCalls} used={state.usage.autoSupervisorCalls ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxSupervisorCalls: value } })} />
-              <BudgetField id="workflow-setting-maxWorkerCalls" label="工作者自动调用上限" value={state.settings.maxWorkerCalls} used={state.usage.autoWorkerCalls ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxWorkerCalls: value } })} />
-              <BudgetField id="workflow-setting-maxRetries" label="工作者额外返工上限" value={state.settings.maxRetries} min={0} max={20} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxRetries: value } })} />
+              <BudgetField key={state.id + ':supervisor'} id="workflow-setting-maxSupervisorCalls" label="监工自动调用上限" value={state.settings.maxSupervisorCalls} used={state.usage.autoSupervisorCalls ?? 0} max={2000} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxSupervisorCalls: value }, expectedSettings: { maxSupervisorCalls: expected } })} />
+              <BudgetField key={state.id + ':worker'} id="workflow-setting-maxWorkerCalls" label="工作者自动调用上限" value={state.settings.maxWorkerCalls} used={state.usage.autoWorkerCalls ?? 0} max={2000} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxWorkerCalls: value }, expectedSettings: { maxWorkerCalls: expected } })} />
+              <BudgetField key={state.id + ':retries'} id="workflow-setting-maxRetries" label="工作者额外返工上限" value={state.settings.maxRetries} min={0} max={20} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxRetries: value }, expectedSettings: { maxRetries: expected } })} />
               <p className="context-note">此上限限制交付被判未达标后的返工。每次启动都计入工作者总调用预算，中断后重新执行也不会返还已用调用。</p>
-              <BudgetField id="workflow-setting-maxReviewRetries" label="核查额外调用上限" value={state.settings.maxReviewRetries ?? 1} min={0} max={10} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxReviewRetries: value } })} />
+              <BudgetField key={state.id + ':review'} id="workflow-setting-maxReviewRetries" label="核查额外调用上限" value={state.settings.maxReviewRetries ?? 1} min={0} max={10} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxReviewRetries: value }, expectedSettings: { maxReviewRetries: expected } })} />
               <p className="context-note">每次工作者交付最多核查 {reviewLimit(state)} 次，包含首次核查和额外调用。已启动次数包含取消与监工交接；暂停、继续或换监工会保留次数。核查沿用监工及提供方自动调用预算。</p>
-              <BudgetField id="workflow-setting-maxProviderCalls.codex" label="Codex 自动调用上限" value={state.settings.maxProviderCalls?.codex ?? 12} used={state.usage.autoProviderCalls?.codex ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { codex: value } } })} />
-              <BudgetField id="workflow-setting-maxProviderCalls.deepseek" label="DeepSeek 自动调用上限" value={state.settings.maxProviderCalls?.deepseek ?? 16} used={state.usage.autoProviderCalls?.deepseek ?? 0} max={2000} disabled={anyPending} onSave={value => action({ action: 'settings', settings: { maxProviderCalls: { deepseek: value } } })} />
+              <BudgetField key={state.id + ':codex'} id="workflow-setting-maxProviderCalls.codex" label="Codex 自动调用上限" value={state.settings.maxProviderCalls?.codex ?? 12} used={state.usage.autoProviderCalls?.codex ?? 0} max={2000} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxProviderCalls: { codex: value } }, expectedSettings: { maxProviderCalls: { codex: expected } } })} />
+              <BudgetField key={state.id + ':deepseek'} id="workflow-setting-maxProviderCalls.deepseek" label="DeepSeek 自动调用上限" value={state.settings.maxProviderCalls?.deepseek ?? 16} used={state.usage.autoProviderCalls?.deepseek ?? 0} max={2000} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxProviderCalls: { deepseek: value } }, expectedSettings: { maxProviderCalls: { deepseek: expected } } })} />
               <p className="context-note">{state.mode === 'demo' ? '演示调用计数' : '全部实际调用'}：监工 {state.usage.supervisorCalls} 次，工作者 {state.usage.workerCalls} 次；Codex {state.usage.providerCalls?.codex ?? 0} 次，DeepSeek {state.usage.providerCalls?.deepseek ?? 0} 次。上限限制自动协作，不代表精确订阅额度；手动聊天单独计量。调整上限会保留已用计数。</p>
             </div></details>
             {!cooperating && <p className="context-note">请先在顶栏切换「合作」，再确认新委托或继续已有工作。</p>}
@@ -421,11 +428,6 @@ function NewAgentEditor({ catalog, count, pending, onAdd, onCancel }: { catalog:
     </div>
     <div className="agent-editor-actions"><label className="workflow-check"><input type="checkbox" checked={form.hidden} disabled={pending} onChange={event => edit({ hidden: event.target.checked })} />加入后隐藏聊天</label><button className="button secondary" type="button" disabled={pending} onClick={onCancel}>取消</button><button className="button primary" type="submit" disabled={pending || count >= 8 || !form.name.trim()}>加入团队</button></div>
   </form>;
-}
-function BudgetField({ id, label, value, used, min = 1, max = 100, disabled, onSave }: { id?: string; label: string; value: number; used?: number; min?: number; max?: number; disabled: boolean; onSave: (value: number) => Promise<boolean> }) {
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
-  return <label className="workflow-field inline">{label}<input id={id} type="number" aria-label={label} min={min} max={max} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} onBlur={async () => { const number = Number(draft); if (!draft.trim() || !Number.isInteger(number) || number < min || number > max) { setDraft(String(value)); return; } if (number !== value && !await onSave(number)) setDraft(String(value)); }} />{used !== undefined && <small>自动已用 {used} 次</small>}</label>;
 }
 
 type ChatPaneProps = { agent: Agent; state: State; selectedConversation?: string; connected: boolean; pending: boolean; showWorkflow: boolean; providerReady?: boolean; models: ModelCatalog | null; embedded: boolean; input: string; onInput: (text: string) => void; onSent: (text: string) => void; onSend: (text: string) => Promise<boolean>; onNew: () => void; onCancel: () => void; onHistory: () => void; onReturn: () => void; onModel: (model: string) => void; onEffort: (effort: string) => void; onSettings: () => void };

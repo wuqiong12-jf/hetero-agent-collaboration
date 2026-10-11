@@ -65,9 +65,12 @@ if (recoveryScene) await engine.action({action:'start'});
 // Optional latency for reproducing close/reopen races in the isolated UI.
 const actionDelay = Number(process.env.RELAY_FIXTURE_ACTION_DELAY_MS || 0);
 if (!Number.isInteger(actionDelay) || actionDelay < 0 || actionDelay > 10000) throw new Error('Invalid fixture action delay');
+let settingsFailures = Number(process.env.RELAY_FIXTURE_SETTINGS_FAILURES || 0);
+if (!Number.isInteger(settingsFailures) || settingsFailures < 0 || settingsFailures > 3) throw new Error('Invalid fixture settings failures');
 const action = engine.action.bind(engine);
 engine.action = async payload => {
-  if (actionDelay && ['saveGoalBrief', 'confirmGoalBrief'].includes(payload?.action)) await new Promise(resolve => setTimeout(resolve, actionDelay));
+  if (actionDelay && ['saveGoalBrief', 'confirmGoalBrief', 'settings'].includes(payload?.action)) await new Promise(resolve => setTimeout(resolve, actionDelay));
+  if (payload?.action === 'settings' && settingsFailures > 0) { settingsFailures--; throw Object.assign(new Error('【隔离演示】模拟保存服务暂不可用，设置没有变化。'), {status:503}); }
   return action(payload);
 };
 const port=Number(process.env.RELAY_FIXTURE_PORT || 4319);

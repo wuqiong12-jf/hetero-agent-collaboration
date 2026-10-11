@@ -335,6 +335,10 @@ body.resizing, body.resizing * { cursor: col-resize !important; user-select: non
 .modal-content .workflow-field.inline { flex-wrap: wrap; }
 .modal-content .workflow-field.inline input[type="number"] { width: 76px; flex: 0 0 76px; margin-left: auto; }
 .workflow-field.inline small { font-size: 11px; }
+.budget-field { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.budget-notice { display: flex; flex-direction: column; gap: 7px; padding: 9px 11px; border: 1px solid #eee4d2; border-radius: 6px; background: #fffcf6; color: #9c855f; font-size: 12px; line-height: 1.75; overflow-wrap: anywhere; }
+.budget-notice > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.budget-notice .button { min-height: 27px; padding: 4px 8px; font-size: 11px; }
 .workflow-field.inline select { flex: 1; min-width: 0; max-width: 240px; }
 .review-problems { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .review-problems > strong { color: #8b779e; font-size: 13px; }
