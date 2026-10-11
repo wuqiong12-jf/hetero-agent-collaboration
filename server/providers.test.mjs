@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createProviders, JsonLines, processLaunch } from './providers.mjs';
+import { CODEX_READONLY_FEATURES } from './codex-readonly.mjs';
 
 function fakeProcess(onInput) {
   const child = new EventEmitter();
@@ -33,7 +34,7 @@ function fakeProcess(onInput) {
   return child;
 }
 
-function codexFixture({ auth = 'chatgpt', status = 'completed', approval = false, hang = false, missingResume = false, env = {}, fetch, models, childSetup, onTurnStart, cleanupTimeoutMs } = {}) {
+function codexFixture({ auth = 'chatgpt', status = 'completed', approval = false, hang = false, missingResume = false, env = {}, fetch, models, childSetup, onTurnStart, cleanupTimeoutMs, unsafeReadOnly = false } = {}) {
   const calls = [];
   const children = [];
   const turnCounts = new Map();
@@ -43,6 +44,9 @@ function codexFixture({ auth = 'chatgpt', status = 'completed', approval = false
     const child = fakeProcess((request, cp) => {
       if (request.method === 'initialize') cp.send({ id: request.id, result: { userAgent: 'fixture' } });
       else if (request.method === 'account/read') cp.send({ id: request.id, result: { account: { type: auth, email: 'private@example.test' } } });
+      else if (request.method === 'config/read') cp.send({id:request.id,result:{config:{mcp_servers:{fixture:{command:'fixture'}}}}});
+      else if (request.method === 'experimentalFeature/list') cp.send({id:request.id,result:{data:CODEX_READONLY_FEATURES.map(name=>({name,enabled:false})),nextCursor:null}});
+      else if (request.method === 'mcpServerStatus/list') cp.send({id:request.id,result:{data:[{name:'fixture',runtimeStatus:unsafeReadOnly?'connected':'disabled',tools:unsafeReadOnly?{unsafeWrite:{}}:{}}],nextCursor:null}});
       else if (request.method === 'model/list') cp.send({ id: request.id, result: { data: models || [{ id: 'catalog-key', model: 'fixture-model', displayName: 'Fixture Model', isDefault: true,
         supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Lower latency' }, { reasoningEffort: 'high', description: 'More thinking' }], defaultReasoningEffort: 'high' }], nextCursor: null } });
       else if (request.method === 'thread/start') {
@@ -137,7 +141,26 @@ test('read-only Codex uses the locally generated schema tags on start, resume an
   await fixture.providers.runAgent({ agent: { provider: 'codex', accessMode: 'read-only' }, prompt: 'continue inspecting', session: first.session });
   assert.equal(fixture.children[0].received.find(frame => frame.method === 'thread/start').params.sandbox, 'read-only');
   assert.equal(fixture.children[1].received.find(frame => frame.method === 'thread/resume').params.sandbox, 'read-only');
-  for (const child of fixture.children) assert.deepEqual(child.received.find(frame => frame.method === 'turn/start').params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.deepEqual(fixture.children[0].received.find(frame => frame.method === 'thread/start').params.dynamicTools, []);
+  assert.equal(Object.hasOwn(fixture.children[1].received.find(frame => frame.method === 'thread/resume').params, 'dynamicTools'), false);
+  for (const child of fixture.children) {
+    const setup = child.received.find(frame => ['thread/start', 'thread/resume'].includes(frame.method));
+    assert.equal(setup.params.config.mcp_servers.fixture.enabled, false);
+    assert.equal(setup.params.config.features.apps, false);
+    assert.equal(setup.params.config.features.plugins, false);
+    assert.equal(setup.params.config.features.multi_agent, false);
+    const verifyIndex = child.received.findIndex(frame => frame.method === 'mcpServerStatus/list');
+    const turnIndex = child.received.findIndex(frame => frame.method === 'turn/start');
+    assert.ok(verifyIndex >= 0 && verifyIndex < turnIndex);
+    assert.deepEqual(child.received[turnIndex].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  }
+});
+
+test('read-only Codex stops before inference and confirms cleanup when inherited external tools remain enabled', async () => {
+  const fixture = codexFixture({unsafeReadOnly:true});
+  await assert.rejects(fixture.providers.runAgent({agent:{provider:'codex',accessMode:'read-only'},prompt:'inspect'}), error => error.code === 'RELAY_CODEX_READONLY_UNVERIFIED' && error.cleanupConfirmed === true);
+  assert.equal(fixture.children[0].received.some(frame=>frame.method==='turn/start'),false);
+  assert.equal(fixture.children[0].killed,true);
 });
 
 test('provider run takes an independent access/model/effort snapshot before asynchronous handshake', async () => {
@@ -644,10 +667,20 @@ class DeepSeekHarness:
     def __init__(self, **options):
         assert options['profile'] == 'sdk'
         assert options['model'] == 'deepseek-flash'
-        assert options['dsh_home'].endswith('isolated-home')
         assert options.get('reasoning_effort') == os.environ.get('RELAY_EXPECT_EFFORT')
         policy = Path(options['patches'][0]).read_text(encoding='utf8')
         access_mode = os.environ.get('RELAY_EXPECT_ACCESS_MODE', 'workspace-write')
+        selected_home = Path(options['dsh_home'])
+        if access_mode == 'read-only':
+            assert selected_home.parent.name == 'isolated-home'
+            assert selected_home.name.startswith('relay-harness-readonly-')
+            assert not (selected_home / 'cordis.patch.yml').exists()
+            for module in ('tool-workflow', 'workflow-worker-thread', 'tool-ralph', 'tool-subagent', 'tool-subagent-fork', 'tool-subagent-control', 'tool-subagent-list-agents'):
+                assert f'- id: {module}\\n  disabled: true' in policy
+        else:
+            assert selected_home.name == 'isolated-home'
+            assert '- id: tool-workflow\\n  disabled: true' not in policy
+        (Path(options['cwd']) / 'selected-home.marker').write_text(str(selected_home), encoding='utf8')
         preset = 'relay-readonly' if access_mode == 'read-only' else 'relay-workspace'
         assert f'mode: {access_mode}' in policy
         assert 'policy: never' in policy
@@ -702,8 +735,14 @@ class DeepSeekHarness:
     assert.equal(invalidRun.status, 1);
     assert.match(invalidRun.stdout, /Unsupported Harness reasoning effort/);
     const readonlyInput = JSON.stringify({ workspace: temporary, home: join(temporary, 'isolated-home'), prompt: '中文 prompt & $(must stay literal)', accessMode: 'read-only' }) + '\n';
+    const inheritedPatch = join(temporary, 'isolated-home', 'cordis.patch.yml');
+    writeFileSync(inheritedPatch, 'SYNTHETIC_INHERITED_EXTERNAL_CONFIG', 'utf8');
     const readonlyRun = spawnSync(fixturePython, ['-u', bridge], { env: { ...env, RELAY_EXPECT_ACCESS_MODE: 'read-only' }, input: readonlyInput, encoding: 'utf8', timeout: 5000 });
     assert.equal(readonlyRun.status, 0, readonlyRun.stdout + readonlyRun.stderr);
+    const selectedHome = readFileSync(join(temporary, 'selected-home.marker'), 'utf8');
+    assert.equal(dirname(selectedHome), join(temporary, 'isolated-home'));
+    assert.equal(existsSync(selectedHome), false, 'temporary readonly home is removed after runtime exit');
+    assert.equal(readFileSync(inheritedPatch, 'utf8'), 'SYNTHETIC_INHERITED_EXTERNAL_CONFIG');
     const badAccessInput = JSON.stringify({ workspace: temporary, home: join(temporary, 'isolated-home'), prompt: '中文 prompt & $(must stay literal)', accessMode: 'danger-full-access' }) + '\n';
     const badAccessRun = spawnSync(fixturePython, ['-u', bridge], { env, input: badAccessInput, encoding: 'utf8', timeout: 5000 });
     assert.equal(badAccessRun.status, 1);

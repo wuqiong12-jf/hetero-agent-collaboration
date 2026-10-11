@@ -42,7 +42,7 @@ function reviewDisabledReason(task: Task, state: State, pending: boolean, connec
 const unfinishedTasks = (agent: Agent, state: State) => state.tasks.filter(task => task.agentId === agent.id && !['accepted', 'cancelled'].includes(task.status));
 const configLocked = (agent: Agent, state: State) => agentBusy(agent, state) || state.phase === 'running';
 const workMode = (agent: Agent) => agent.accessMode === 'read-only' ? 'read-only' : 'workspace-write';
-const workModeNote = (agent: Agent) => '配置：' + (workMode(agent) === 'read-only' ? '只读分析，可并行。' : '修改文件，独占工作目录。') + '规划与核查固定只读，实际执行方式以运行计数为准。';
+const workModeNote = (agent: Agent) => '配置：' + (workMode(agent) === 'read-only' ? '只读分析，可并行；禁用继承的外部 MCP／连接器及内部派生智能体。' : '修改文件，独占工作目录，沿用既有工具配置。') + '规划与核查固定只读，实际执行方式以运行计数为准。';
 const identitySignature = (agent: Agent | undefined) => agent ? JSON.stringify([agent.provider, agent.modelId || 'default', agent.reasoningEffort || 'auto', workMode(agent)]) : '';
 function executionLabel(state: State): string {
   const summary = state.executionSummary;
@@ -352,7 +352,7 @@ export default function App() {
             <label className="workflow-check"><input type="checkbox" checked={state.settings.autoDispatch} disabled={anyPending} onChange={event => action({ action: 'settings', settings: { autoDispatch: event.target.checked }, expectedSettings: { autoDispatch: state.settings.autoDispatch } })} />核查后继续分工</label>
             <label className="workflow-check"><input type="checkbox" checked={showWorkflow} onChange={event => setShowWorkflow(event.target.checked)} />在对话中显示本次协作输出</label>
             <BudgetField key={state.id + ':parallel'} label="同时只读智能体上限" value={state.settings.maxParallelReaders ?? 3} max={4} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxParallelReaders: value }, expectedSettings: { maxParallelReaders: expected } })} />
-            <p className="context-note">最多同时运行 1–4 个只读执行，独立聊天与合作任务共享此限额。写入执行独占目录；当前 {executionLabel(state)}。</p>
+            <p className="context-note">最多同时运行 1–4 个只读执行，独立聊天与合作任务共享此限额。只读执行禁用继承的外部工具及内部派生智能体；写入执行沿用既有工具配置并独占目录。当前 {executionLabel(state)}。</p>
             <details className="workflow-budget" open={budgetOpen} onToggle={event => setBudgetOpen(event.currentTarget.open)}><summary>预算与返工上限</summary><div>
               <BudgetField key={state.id + ':supervisor'} id="workflow-setting-maxSupervisorCalls" label="监工自动调用上限" value={state.settings.maxSupervisorCalls} used={state.usage.autoSupervisorCalls ?? 0} max={2000} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxSupervisorCalls: value }, expectedSettings: { maxSupervisorCalls: expected } })} />
               <BudgetField key={state.id + ':worker'} id="workflow-setting-maxWorkerCalls" label="工作者自动调用上限" value={state.settings.maxWorkerCalls} used={state.usage.autoWorkerCalls ?? 0} max={2000} disabled={anyPending} onSave={(value, expected) => action({ action: 'settings', settings: { maxWorkerCalls: value }, expectedSettings: { maxWorkerCalls: expected } })} />

@@ -208,8 +208,13 @@ harness_bridge.Path.resolve = fixture_resolve
 # checks the policy and public constructor arguments rather than OS ACLs.
 class FixturePolicyDirectory:
     def __init__(self, *, prefix, dir):
-        assert prefix == 'relay-harness-policy-'
-        assert str(dir) == payload['run']['home']
+        if prefix == 'relay-harness-readonly-':
+            assert str(dir) == payload['run']['home']
+        else:
+            assert prefix == 'relay-harness-policy-'
+            expected = (harness_bridge.os.environ['POLICY_DIRECTORY']
+                        if payload['run'].get('accessMode') == 'read-only' else payload['run']['home'])
+            assert str(dir) == expected
         harness_bridge.Path(harness_bridge.os.environ['POLICY_TEMP_MARKER']).write_text('entered', encoding='utf-8')
     def __enter__(self):
         return harness_bridge.os.environ['POLICY_DIRECTORY']
@@ -342,11 +347,14 @@ test('override probe and run select the same checked carrier through the public 
   assert.equal(options.dsh_bin, resolve(carrier));
   assert.equal('_launch_args' in options, false);
   assert.equal(options.profile, 'sdk');
+  assert.equal(options.dsh_home, env.POLICY_DIRECTORY, 'constructor uses the synthetic fresh readonly home, not the inherited one');
+  assert.notEqual(options.dsh_home, home);
   assert.equal(options.reasoning_effort, 'high');
   assert.deepEqual(options.env, { DSH_PERMISSION_MODE: 'read-only', DSH_MAX_TOKENS_AS_SUCCESS: 'false' });
   assert.match(options.policy, /mode: read-only/);
   assert.match(options.policy, /policy: never/);
   assert.match(options.policy, /sandbox: read-only\n        approval: never/);
+  assert.match(options.policy, /- id: tool-workflow\n  disabled: true/);
   assert.equal(existsSync(env.RESOLVER_MARKER), false);
   assert.equal(existsSync(env.RUN_MARKER), false);
 });

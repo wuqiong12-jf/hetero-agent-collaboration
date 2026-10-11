@@ -228,11 +228,11 @@ test('request failures after identity verification keep upstream details private
   assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
 });
 
-test('0.6.4 resource registration retains 0.6.3 and earlier aliases and uses current inline bundle bytes',async()=>{
+test('0.6.5 resource registration retains 0.6.4 and earlier aliases and uses current inline bundle bytes',async()=>{
   const api=createProtocol({fetcher:async()=>{throw new Error('resource must not make a service or model request')}});
   const resources=(await api.handle('resources/list')).resources;
-  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.6.4/workspace','ui://relay/v0.6.4/panel']);
-  for(const uri of ['ui://relay/v0.6.3/workspace','ui://relay/v0.6.3/panel','ui://relay/v0.6.2/workspace','ui://relay/v0.6.2/panel','ui://relay/v0.6.1/workspace','ui://relay/v0.6.1/panel','ui://relay/v0.6.0/workspace','ui://relay/v0.6.0/panel','ui://relay/v0.5.3/workspace','ui://relay/v0.5.3/panel','ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel','ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
+  assert.deepEqual(resources.map(resource=>resource.uri),['ui://relay/v0.6.5/workspace','ui://relay/v0.6.5/panel']);
+  for(const uri of ['ui://relay/v0.6.4/workspace','ui://relay/v0.6.4/panel','ui://relay/v0.6.3/workspace','ui://relay/v0.6.3/panel','ui://relay/v0.6.2/workspace','ui://relay/v0.6.2/panel','ui://relay/v0.6.1/workspace','ui://relay/v0.6.1/panel','ui://relay/v0.6.0/workspace','ui://relay/v0.6.0/panel','ui://relay/v0.5.3/workspace','ui://relay/v0.5.3/panel','ui://relay/v0.5.2/workspace','ui://relay/v0.5.2/panel','ui://relay/v0.5.1/workspace','ui://relay/v0.5.1/panel','ui://relay/v0.5.0/workspace','ui://relay/v0.5.0/panel','ui://relay/v0.4.0/workspace','ui://relay/v0.4.0/panel']){
     const result=await api.handle('resources/read',{uri});
     assert.equal(result.contents[0].uri,uri);
     assert.ok(result.contents[0].text.includes('window.__RELAY_NATIVE__=true;'));
@@ -323,10 +323,10 @@ function finishWorker(state,output='PUBLIC_WORKER_RESULT') {
 }
 const delegation={agentId:'worker',task:'整理实际产物并报告检查',criteria:['产物位置明确','检查结果可验证']};
 
-test('native delegation tools are model-visible at 0.6.4 without exposing arbitrary routes',async()=>{
+test('native delegation tools are model-visible at 0.6.5 without exposing arbitrary routes',async()=>{
   const fixture=teamFixture();
   const init=await fixture.api.handle('initialize');
-  assert.equal(init.serverInfo.version,'0.6.4');
+  assert.equal(init.serverInfo.version,'0.6.5');
   const status=tools.find(tool=>tool.name==='agent_team_status');
   const delegate=tools.find(tool=>tool.name==='delegate_agent_task');
   assert.equal(status.annotations.readOnlyHint,true);

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from harness_runtime import inspect_runtime
@@ -182,12 +183,30 @@ def token_usage(events: list) -> dict | None:
     return total or None
 
 
+READONLY_DISABLED_MODULES = (
+    "tool-workflow", "workflow-worker-thread", "tool-ralph", "tool-subagent",
+    "tool-subagent-fork", "tool-subagent-control", "tool-subagent-list-agents",
+)
+
+
+@contextmanager
+def execution_home(home: Path, access_mode: str):
+    """Do not load an existing home/profile's external plugins for read-only work."""
+    if access_mode not in ("read-only", "workspace-write"):
+        raise ValueError("accessMode must be read-only or workspace-write.")
+    if access_mode == "read-only":
+        with tempfile.TemporaryDirectory(prefix="relay-harness-readonly-", dir=home) as owned:
+            yield Path(owned)
+    else:
+        yield home
+
+
 def permission_patch(access_mode: str) -> str:
     """Bundle the exact sandbox mode with deterministic rejection of upgrades."""
     if access_mode not in ("read-only", "workspace-write"):
         raise ValueError("accessMode must be read-only or workspace-write.")
     preset = "relay-readonly" if access_mode == "read-only" else "relay-workspace"
-    return f"""- id: sandbox-policy
+    patch = f"""- id: sandbox-policy
   config:
     mode: {access_mode}
 - id: approval
@@ -204,6 +223,11 @@ def permission_patch(access_mode: str) -> str:
   config:
     maxTokensAsSuccess: false
 """
+    if access_mode == "read-only":
+        # Workflow's host VM is outside the filesystem sandbox. Nested agent
+        # tools also create work outside Relay's own per-agent call accounting.
+        patch += "".join(f"- id: {module}\n  disabled: true\n" for module in READONLY_DISABLED_MODULES)
+    return patch
 
 
 def run(payload: dict) -> None:
@@ -282,7 +306,7 @@ def run(payload: dict) -> None:
             emit({"type": "tool", "method": kind,
                   "text": f"\n[工具输出：{name}]\n{scrub(content)}\n"})
 
-    with tempfile.TemporaryDirectory(prefix="relay-harness-policy-", dir=home) as temp:
+    with execution_home(home, access_mode) as selected_home, tempfile.TemporaryDirectory(prefix="relay-harness-policy-", dir=selected_home) as temp:
         patch = Path(temp) / "relay-policy.patch.yml"
         patch.write_text(patch_text, encoding="utf-8")
         harness = DeepSeekHarness(
@@ -291,7 +315,7 @@ def run(payload: dict) -> None:
             max_tokens=int(payload.get("maxTokens") or 8192),
             cwd=str(workspace),
             runtime_cwd=str(workspace),
-            dsh_home=str(home),
+            dsh_home=str(selected_home),
             profile="sdk",
             patches=(str(patch),),
             initialize_timeout_seconds=30,

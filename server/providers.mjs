@@ -5,6 +5,7 @@ import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { StringDecoder } from 'node:string_decoder';
 import { desktopCodexBinary } from './native-codex.mjs';
+import { codexReadOnlyConfig, verifyCodexReadOnly } from './codex-readonly.mjs';
 
 const BRIDGE = fileURLToPath(new URL('./harness_bridge.py', import.meta.url));
 const INITIALIZE = { clientInfo: { name: 'relay_workbench', title: 'Relay Agent Workbench', version: '0.1.0' } };
@@ -364,8 +365,8 @@ export function createProviders(options = {}) {
     };
   }
 
-  async function initialize(session) {
-    await session.request('initialize', INITIALIZE);
+  async function initialize(session, experimentalApi = false) {
+    await session.request('initialize', experimentalApi ? { ...INITIALIZE, capabilities: { experimentalApi: true } } : INITIALIZE);
     session.notify('initialized');
   }
 
@@ -591,23 +592,29 @@ export function createProviders(options = {}) {
     } });
     const offFailure = session.onFailure(failTurn);
     try {
-      await initialize(session);
+      await initialize(session, accessMode === 'read-only');
       const account = await session.request('account/read', { refreshToken: false });
       if (account?.account?.type !== 'chatgpt') throw new Error('此工作台要求本机 Codex 的 ChatGPT 登录；不使用 OpenAI API key。');
       const model = agentModelId(agent) || env.RELAY_CODEX_MODEL;
       const modelCatalog = effort ? await readCodexModels(session) : undefined;
-      const startParams = { cwd: workspace, approvalPolicy: 'never', sandbox: accessMode, modelProvider: 'openai', ...(model && model !== 'default' ? { model } : {}) };
+      const readOnlyConfig = accessMode === 'read-only' ? await codexReadOnlyConfig(session, workspace) : undefined;
+      const startParams = { cwd: workspace, approvalPolicy: 'never', sandbox: accessMode, modelProvider: 'openai', ...(model && model !== 'default' ? { model } : {}),
+        ...(readOnlyConfig ? { config: readOnlyConfig } : {}) };
       const thread = previousSession
         ? await session.request('thread/resume', { threadId: previousSession.id, ...startParams })
-        : await session.request('thread/start', startParams);
+        : await session.request('thread/start', { ...startParams, ...(readOnlyConfig ? { dynamicTools: [] } : {}) });
       threadId = thread?.thread?.id;
       if (!threadId) throw new Error('Codex 未返回有效 threadId。');
       if (previousSession && threadId !== previousSession.id) throw new Error('Codex 恢复返回了不同会话；为避免丢失上下文已停止。');
-      reference = { provider: 'codex', id: threadId };
-      onSession?.({ ...reference });
       const effectiveModel = model || thread.model || thread.thread?.model;
       const effortModel = modelCatalog?.find(entry => effectiveModel ? entry.id === effectiveModel : entry.isDefault);
       assertReasoningEffort(effortModel, effort);
+      if (readOnlyConfig) await verifyCodexReadOnly(session, threadId);
+      // A fresh thread rejected by preflight may have no durable rollout yet.
+      // Do not save it as a resumable session before all checks pass. Existing
+      // session references remain intact when a resume preflight is rejected.
+      reference = { provider: 'codex', id: threadId };
+      onSession?.({ ...reference });
       turnRequested = true;
       await session.request('turn/start', {
         threadId, input: [{ type: 'text', text: prompt }], cwd: workspace, approvalPolicy: 'never',
