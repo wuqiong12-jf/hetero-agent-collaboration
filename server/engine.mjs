@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, copyFileSync, promises as filesystem } from 'node:fs';
+import { existsSync, readFileSync, promises as filesystem } from 'node:fs';
 import { dirname } from 'node:path';
 import { describeRecovery } from './recovery.mjs';
+import { createWorkspaceBinding, assertWorkspaceBinding, WorkspaceBindingError } from './workspace.mjs';
 
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}-${randomUUID()}`;
@@ -111,7 +112,9 @@ export class Orchestrator {
   constructor({ providers = noProviders, persistencePath, workspace = process.cwd(), demoDelayMs = 430, initialState, fileOps = {}, persistenceRetryDelays = [25, 75, 150, 300, 600] } = {}) {
     this.providers = providers;
     this.persistencePath = persistencePath;
-    this.workspace = workspace;
+    const binding = createWorkspaceBinding(workspace);
+    Object.defineProperty(this, 'workspace', {value: binding.directory, enumerable: true});
+    Object.defineProperty(this, 'workspaceBinding', {value: binding, enumerable: true});
     this.demoDelayMs = demoDelayMs;
     this.listeners = new Set();
     this.runs = new Map();
@@ -133,6 +136,7 @@ export class Orchestrator {
     if (persistencePath && existsSync(persistencePath)) {
       try {
         const saved = JSON.parse(readFileSync(persistencePath, 'utf8'));
+        assertWorkspaceBinding(saved.workspaceBinding, this.workspace);
         if (!Array.isArray(saved.tasks) || !Array.isArray(saved.agents) || saved.agents.length < 2 || saved.agents.length > 8 || new Set(saved.agents.map((agent) => agent.id)).size !== saved.agents.length || saved.agents.some((agent) => !PROVIDERS.has(agent.provider)) || !Array.isArray(saved.messages) || !saved.settings || !saved.usage || !['demo', 'live'].includes(saved.mode)) throw new Error('无效状态文件');
         this.state = saved;
         this.state.settings = { ...defaults, ...saved.settings };
@@ -144,10 +148,16 @@ export class Orchestrator {
           this._activity('restore', '上次运行已中断。已保留输出并暂停；继续后重新执行未完成任务、重新核查待验收结果。');
         }
       } catch (error) {
-        try { copyFileSync(persistencePath, `${persistencePath}.invalid-${Date.now()}`); } catch { /* Keep the original if a backup cannot be made. */ }
-        this._activity('restore', `状态文件无法恢复，已建立新演示会话：${error.message}`);
+        // Directory failures must never enter the corrupt-state fallback: it
+        // writes a fresh snapshot and could erase another project's work.
+        if (error instanceof WorkspaceBindingError) throw error;
+        // An unreadable/corrupt file has no trustworthy origin either. Keep it
+        // intact rather than rebinding a fresh demo to the requested directory.
+        throw new WorkspaceBindingError('协作快照无法读取或格式无效，已停止恢复且原文件保留。请保留备份后检查文件，不会用新演示覆盖它。', 'RELAY_STATE_INVALID');
       }
     }
+    if (this.state.workspaceBinding !== undefined) assertWorkspaceBinding(this.state.workspaceBinding, this.workspace);
+    this.state.workspaceBinding = clone(this.workspaceBinding);
     if (!['independent', 'cooperative'].includes(this.state.collaborationMode)) this.state.collaborationMode = 'independent';
     if (this.state.collaborationMode === 'independent' && this.state.phase === 'running') {
       this.state.phase = 'paused';
@@ -181,6 +191,7 @@ export class Orchestrator {
 
   getState() {
     const snapshot = clone(this.state);
+    snapshot.workspaceBinding = clone(this.workspaceBinding);
     const taskActors = Object.fromEntries(this.state.tasks.filter(task => ['queued', 'rejected'].includes(task.status)).map(task => {
       const actor = this._taskActor(task);
       return [task.id, actor ? { id: actor.id, name: actor.name, provider: actor.provider, accessMode: actor.accessMode, status: actor.status } : undefined];
@@ -210,6 +221,10 @@ export class Orchestrator {
   async _handleAction(payload) {
     this._assertOpen();
     if (!payload || typeof payload.action !== 'string') throw new ActionError('缺少 action');
+    if (Object.hasOwn(payload, 'expectedStateId')) {
+      if (typeof payload.expectedStateId !== 'string' || !payload.expectedStateId || payload.expectedStateId.length > 256) throw new ActionError('expectedStateId 必须是当前协作会话标识');
+      if (payload.expectedStateId !== this.state.id) throw new ActionError('协作状态已变化，请重新读取并核对工作目录后再操作；未更改新会话或启动模型', 409);
+    }
     const confirmation = payload.action === 'confirmGoalBrief' ? this._goalConfirmation(payload) : undefined;
     if (confirmation?.alreadyConfirmed) return this.getState();
     if (['start', 'resume', 'review', 'retry', 'cooperativeGoal', 'confirmGoalBrief', 'message'].includes(payload.action) && (this.state.pendingCleanup.length || [...this.retiringRuns.values()].some((run) => run.cleanupFailed))) throw new ActionError('无法确认旧模型进程已停止，工作空间锁仍保留；请先由适配器确认相关进程已退出', 503);
@@ -758,9 +773,10 @@ export class Orchestrator {
     if (!this.persistencePath) return;
     // Coalesce intermediate streaming snapshots while one atomic write is in
     // flight. Never delete the last valid destination to work around a lock.
-    this.pendingSnapshot = JSON.stringify(snapshot, null, 2);
+    this.pendingSnapshot = this._serializeSnapshot(snapshot);
     this._schedulePersistence();
   }
+  _serializeSnapshot(snapshot) { return JSON.stringify({...snapshot, workspaceBinding: this.workspaceBinding}, null, 2); }
   _schedulePersistence() {
     if (this.persistenceFailure || this.persistenceTask) return;
     this.persistenceTask = this._drainPersistence().finally(() => {
@@ -786,7 +802,7 @@ export class Orchestrator {
         this._activity('persistence-error', this.persistenceFailure);
         this._updateAgentStatus(); this.state.updatedAt = now();
         this._bumpRevision();
-        this.pendingSnapshot = JSON.stringify(this.state, null, 2);
+        this.pendingSnapshot = this._serializeSnapshot(this.state);
         this._notifyListeners();
         return false;
       }

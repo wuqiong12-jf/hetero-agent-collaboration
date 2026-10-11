@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { request as httpRequest } from 'node:http';
 import { once } from 'node:events';
 import { Orchestrator, createInitialState } from './engine.mjs';
+import {createWorkspaceBinding} from './workspace.mjs';
 
 async function until(engine, predicate, timeout = 2000) {
   const end = Date.now() + timeout;
@@ -144,7 +145,7 @@ test('saved in-flight work restores paused with evidence intact and no automatic
   delete initial.collaborationMode;
   initial.tasks[0].status = 'running'; initial.tasks[0].output = 'preserved partial result';
   initial.tasks[1].status = 'reviewing'; initial.tasks[1].output = 'completed output awaiting review';
-  writeFileSync(persistencePath, JSON.stringify(initial));
+  writeFileSync(persistencePath, JSON.stringify({...initial,workspaceBinding:createWorkspaceBinding(process.cwd())}));
   const engine = new Orchestrator({ persistencePath, demoDelayMs: 2 });
   t.after(async () => { await engine.close(); rmSync(directory, { recursive: true, force: true }); });
   const state = engine.getState();
@@ -326,7 +327,7 @@ test('a transient Windows rename lock retries safely and coalesces the latest UT
   const directory = mkdtempSync(join(tmpdir(), 'relay-persist-test-'));
   const persistencePath = join(directory, 'state.json');
   const previous = createInitialState(); previous.goal = '旧有效状态';
-  writeFileSync(persistencePath, JSON.stringify(previous));
+  writeFileSync(persistencePath, JSON.stringify({...previous,workspaceBinding:createWorkspaceBinding(process.cwd())}));
   let attempts = 0; const sources = []; const removals = [];
   const engine = new Orchestrator({ persistencePath, persistenceRetryDelays: [1, 2], fileOps: {
     rename: async (source, target) => {
@@ -356,7 +357,7 @@ test('exhausted persistence retries preserve the old JSON, visibly pause work, a
   const persistencePath = join(directory, 'state.json');
   const previous = createInitialState(); previous.goal = '最后一次确实保存的目标';
   previous.collaborationMode = 'cooperative';
-  writeFileSync(persistencePath, JSON.stringify(previous));
+  writeFileSync(persistencePath, JSON.stringify({...previous,workspaceBinding:createWorkspaceBinding(process.cwd())}));
   let locked = true; let attempts = 0;
   const engine = new Orchestrator({ persistencePath, demoDelayMs: 5, persistenceRetryDelays: [1, 1], fileOps: {
     rename: async (source, target) => {
@@ -1038,7 +1039,7 @@ test('briefs restore durably and completed same-version confirmation is idempote
 test('draft and confirmation write failures never falsely acknowledge saved confirmation or queue inference', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'relay-brief-test-')); const persistencePath = join(directory, 'state.json');
   const initial = createInitialState(); initial.mode = 'live'; initial.collaborationMode = 'cooperative'; initial.tasks = [];
-  writeFileSync(persistencePath, JSON.stringify(initial)); let locked = false; const calls = [];
+  writeFileSync(persistencePath, JSON.stringify({...initial,workspaceBinding:createWorkspaceBinding(process.cwd())})); let locked = false; const calls = [];
   const engine = new Orchestrator({ persistencePath, providers: { getCapabilities: available, runAgent: (args) => deferredAgent(calls, args) }, persistenceRetryDelays: [1], fileOps: { rename: async (source, target) => { if (locked) throw Object.assign(new Error('test lock'), { code: 'EPERM' }); await filesystem.rename(source, target); } } });
   t.after(async () => { locked = false; await engine.close(); rmSync(directory, { recursive: true, force: true }); });
   await engine.flushPersistence(); locked = true;

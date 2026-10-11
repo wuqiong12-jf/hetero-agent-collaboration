@@ -4,9 +4,11 @@ import { once } from 'node:events';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join, resolve, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
+import {createServer} from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Orchestrator, createInitialState } from './engine.mjs';
 import { createAppServer } from './index.mjs';
+import {canonicalWorkspace,createWorkspaceBinding} from './workspace.mjs';
 
 const fixtureProviders = {
   getCapabilities: async () => ({codex:{available:false},harness:{available:false}}),
@@ -27,11 +29,28 @@ function listen(app, port = 0) {
   return listening;
 }
 
+test('a different bound directory aborts startup, keeps the original bytes and releases the listening port',async t=>{
+  const directory=await fixtureDirectory(t);const path=join(directory,'state.json');
+  const original=createInitialState();original.phase='paused';original.workspaceBinding=createWorkspaceBinding(directory);
+  const bytes=Buffer.from(JSON.stringify(original));await writeFile(path,bytes);
+  let writes=0,calls=0;
+  const app=createAppServer({port:0,persistencePath:path,workspace:process.cwd(),engineFactory:options=>new Orchestrator({...options,
+    providers:{runAgent:()=>{calls++;throw new Error('No models');}},fileOps:{writeFile:()=>{writes++;throw new Error('No writes');}}})});
+  t.after(()=>app.close());const failed=once(app.server,'error');let usedPort;
+  app.server.prependOnceListener('listening',()=>{usedPort=app.server.address().port;});
+  app.server.listen(0,'127.0.0.1');const [error]=await failed;
+  assert.equal(error.code,'RELAY_WORKSPACE_MISMATCH');assert.equal(app.engine,undefined);await app.close();
+  assert.deepEqual(await readFile(path),bytes);assert.equal(writes,0);assert.equal(calls,0);
+  const replacement=createServer();t.after(()=>new Promise(resolve=>replacement.close(()=>resolve())));
+  const rebound=once(replacement,'listening');replacement.listen(usedPort,'127.0.0.1');await rebound;
+  assert.equal(replacement.address().port,usedPort);
+});
+
 test('owned state is created only after binding, and context identifies the ready service', async t => {
   const directory = await fixtureDirectory(t);
   const path = join(directory, 'state.json');
   let created = 0;
-  const app = createAppServer({port:0, persistencePath:path, workspace:'C:/Projects/startup-fixture', engineFactory: options => {
+  const app = createAppServer({port:0, persistencePath:path, workspace:directory, engineFactory: options => {
     assert.equal(app.server.listening, true); created++;
     return new Orchestrator({...options,providers:fixtureProviders});
   }});
@@ -42,12 +61,13 @@ test('owned state is created only after binding, and context identifies the read
   assert.equal(created, 1);
   const response = await fetch(`http://127.0.0.1:${app.server.address().port}/api/context`);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {service:'relay-agent-workbench',protocolVersion:1,workspace:'C:/Projects/startup-fixture',version:'0.6.2'});
+  assert.deepEqual(await response.json(), {service:'relay-agent-workbench',protocolVersion:1,workspace:canonicalWorkspace(directory),version:'0.6.3'});
 });
 
 test('a competing startup cannot load or overwrite the running owner snapshot', async t => {
   const directory = await fixtureDirectory(t); const path = join(directory, 'state.json');
   const saved = createInitialState(); saved.phase = 'paused'; saved.collaborationMode = 'cooperative';
+  saved.workspaceBinding=createWorkspaceBinding(process.cwd());
   saved.tasks = [{id:'retained-startup',title:'Retained startup fixture',description:'fixture',agentId:'deepseek-builder',status:'reviewing',attempt:1,reviewAttempts:1,
     output:'RETAINED_STARTUP_OUTPUT',dependsOn:[],criteria:[{id:'c-fixture',text:'fixture condition',status:'pending'}]}];
   saved.usage.autoWorkerCalls = 3; saved.usage.workerCalls = 3;

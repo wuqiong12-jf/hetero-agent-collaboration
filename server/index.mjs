@@ -32,7 +32,7 @@ async function readJson(request) {
 }
 
 export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPACE || projectRoot, host = '127.0.0.1', port = 4318, assetsRoot = join(projectRoot, 'dist'), modelCatalogProvider = providers,
-  persistencePath = join(projectRoot, '.relay', 'state.json'), engineFactory = options => new Orchestrator(options) } = {}) {
+  persistencePath = process.env.RELAY_STATE_PATH || join(projectRoot, '.relay', 'state.json'), engineFactory = options => new Orchestrator(options) } = {}) {
   // Restoring an engine also writes a new snapshot. An instance that loses the
   // port race must never load or overwrite the running instance's saved work.
   let orchestrator = engine;
@@ -59,7 +59,7 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
         if (!['codex', 'deepseek'].includes(provider)) throw new ActionError('模型提供商无效');
         sendJson(response, await modelCatalogProvider.getModels({ provider })); return;
       }
-      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.6.2' }); return; }
+      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.6.3' }); return; }
       if (request.method === 'GET' && url.pathname === '/api/events') {
         response.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform',

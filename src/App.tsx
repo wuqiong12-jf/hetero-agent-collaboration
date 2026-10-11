@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Check, Command, ExternalLink, Eye, EyeOff, Folder, History, Loader2, MessageSquarePlus, Pause, Play, Plus, RefreshCw, Settings2, Square, Trash2, UsersRound, X } from 'lucide-react';
+import { ArrowUp, Check, Command, Copy, ExternalLink, Eye, EyeOff, Folder, History, Loader2, MessageSquarePlus, Pause, Play, Plus, RefreshCw, Settings2, Square, Trash2, UsersRound, X } from 'lucide-react';
 import type { Agent, Capabilities, GoalBriefFields, Message, ModelCatalog, Provider, RecoverySettingKey, State, Task } from './types';
 import { nativeHost, requestJson, watchState } from './transport';
 import GoalBriefEditor from './GoalBriefEditor';
 import RecoveryPanel from './RecoveryPanel';
 
-type Dialog = 'settings' | 'history' | 'workflow' | 'team' | 'goal' | null;
+type Dialog = 'settings' | 'history' | 'workflow' | 'team' | 'goal' | 'workspace' | null;
 type AgentForm = { name: string; provider: Provider; modelId: string; role: string; reasoningEffort: string; accessMode: 'read-only' | 'workspace-write'; hidden: boolean };
 type CatalogModel = ModelCatalog['models'][number];
 type Action = (payload: Record<string, unknown>, key?: string) => Promise<boolean>;
@@ -14,6 +14,7 @@ const effortLabels: Record<string, string> = { auto: '跟随默认配置', none:
 const phaseLabels: Record<State['phase'], string> = { idle: '准备就绪', running: '协作中', paused: '已暂停', completed: '已完成', blocked: '等待处理' };
 const date = (at: string) => new Date(at).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 const providerName = (provider: Provider) => provider === 'codex' ? 'Codex' : 'DeepSeek';
+const workspaceExecutionActions = new Set(['start', 'resume', 'confirmGoalBrief', 'cooperativeGoal', 'message', 'retry', 'review']);
 const agentBusy = (agent: Agent, state: State) => agent.status !== 'idle' || state.chatSessions?.[agent.id]?.status === 'running';
 const reviewLimit = (state: State) => 1 + (state.settings.maxReviewRetries ?? 1);
 function reviewDisabledReason(task: Task, state: State, pending: boolean, connected: boolean): string {
@@ -105,7 +106,8 @@ export default function App() {
   const [embedded, setEmbedded] = useState(initialEmbedded);
   const [panelOpen, setPanelOpen] = useState(true);
   const [workerId, setWorkerId] = useState('deepseek-builder');
-  const [context, setContext] = useState('');
+  const [legacyWorkspace, setLegacyWorkspace] = useState('');
+  const [workspaceCopyState, setWorkspaceCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [dismissedError, setDismissedError] = useState('');
@@ -141,7 +143,7 @@ export default function App() {
     const generation = capabilityGeneration.current;
     requestJson<Capabilities>('/api/capabilities').then(value => { if (!disposed && generation === capabilityGeneration.current) setCapabilities(value); }).catch(() => {});
     for (const provider of ['codex', 'deepseek'] as const) requestJson<ModelCatalog>('/api/models?provider=' + provider).then(value => { if (!disposed) setModels(old => ({ ...old, [provider]: value })); }).catch(() => {});
-    requestJson<{ workspace: string }>('/api/context').then(value => { if (!disposed) setContext(value.workspace || ''); }).catch(() => {});
+    requestJson<{ workspace: string }>('/api/context').then(value => { if (!disposed) setLegacyWorkspace(value.workspace || ''); }).catch(() => {});
     const view = (event: Event) => { const side = (event as CustomEvent).detail === 'deepseek'; setEmbedded(side); if (side) setPanelOpen(true); };
     window.addEventListener('relay-view', view);
     return () => { disposed = true; stopWatching(); window.removeEventListener('relay-view', view); };
@@ -190,8 +192,12 @@ export default function App() {
     setSettingFocus(null);
   }, [dialog, budgetOpen, settingFocus]);
   const actionResult = async (payload: Record<string, unknown>, key = 'global'): Promise<State | null> => {
+    if (workspaceExecutionActions.has(String(payload.action)) && !stateRef.current?.workspaceBinding?.directory) {
+      setError('后台尚未绑定实际工作目录，请更新并重新连接服务');
+      return null;
+    }
     setPending(old => ({ ...old, [key]: (old[key] || 0) + 1 })); setError('');
-    try { const result = await requestJson<State>('/api/actions', payload); acceptState(result); return result; }
+    try { const result = await requestJson<State>('/api/actions', {expectedStateId: state?.id, ...payload}); acceptState(result); return result; }
     catch (err) { setError(err instanceof Error ? err.message : '无法连接服务'); return null; }
     finally { setPending(old => ({ ...old, [key]: Math.max(0, (old[key] || 1) - 1) })); }
   };
@@ -249,6 +255,14 @@ export default function App() {
   const archives = Object.entries(state?.chatArchives || {}).filter(([, session]) => session.agentId === historyAgent).sort((a, b) => b[1].startedAt.localeCompare(a[1].startedAt));
   const anyPending = bulkBusy || Object.values(pending).some(value => value > 0);
   const busyCount = state ? state.agents.filter(agent => agentBusy(agent, state)).length : 0;
+  const workspaceDirectory = state?.workspaceBinding?.directory || '';
+  const workspacePath = workspaceDirectory || legacyWorkspace;
+  useEffect(() => setWorkspaceCopyState('idle'), [dialog, workspacePath]);
+  const copyWorkspace = async () => {
+    if (!workspacePath) return;
+    try { await navigator.clipboard.writeText(workspacePath); setWorkspaceCopyState('copied'); }
+    catch { setWorkspaceCopyState('failed'); }
+  };
   if (!state || !leader) return <div className="loading-screen"><Command size={25} /><p>{error || '正在连接对话…'}</p><small>本地服务启动后会自动连接。</small></div>;
   const accepted = state.tasks.filter(task => task.status === 'accepted').length;
   const reviewProblems = state.tasks.filter(task => Boolean(task.reviewError));
@@ -259,13 +273,11 @@ export default function App() {
     setError('');
     if (text !== undefined) { goalSequence.current += 1; setGoalSeed({ text, sequence: goalSequence.current }); goalSource.current = source; }
     setDialog('goal');
-    setContext('');
-    requestJson<{ workspace: string }>('/api/context').then(value => setContext(value.workspace || '')).catch(() => setError('无法读取实际工作目录，请连接服务后重试。'));
   };
   const pane = (agent: Agent) => {
     const conversationId = views[agent.id] || state.chatSessions?.[agent.id]?.id || 'current';
     const key = agent.id + ':' + conversationId;
-    return <ChatPane key={agent.id} agent={agent} state={state} selectedConversation={views[agent.id]} connected={connected} pending={Boolean(pending[agent.id])} showWorkflow={Boolean(cooperating || showWorkflow)} providerReady={agent.provider === 'codex' ? capabilities?.codex.available : capabilities?.harness.available} models={models[agent.provider] || null} embedded={embedded} input={drafts[key] || ''} onInput={text => setDrafts(old => ({ ...old, [key]: text }))} onSent={text => setDrafts(old => old[key] === text ? { ...old, [key]: '' } : old)} onSend={text => { if (cooperating && agent.id === state.leaderId) { openGoal(text, { key, text: drafts[key] || text }); return Promise.resolve(false); } return action({ action: 'message', agentId: agent.id, text }, agent.id); }} onNew={() => newChat(agent.id)} onCancel={() => stopAgent(agent)} onHistory={() => { setHistoryAgent(agent.id); setDialog('history'); }} onReturn={() => setViews(old => ({ ...old, [agent.id]: undefined }))} onModel={modelId => updateAgent(agent.id, { modelId, reasoningEffort: 'auto' })} onEffort={reasoningEffort => updateAgent(agent.id, { reasoningEffort })} onSettings={() => setDialog('settings')} />;
+    return <ChatPane key={agent.id} agent={agent} state={state} selectedConversation={views[agent.id]} connected={connected} pending={Boolean(pending[agent.id])} showWorkflow={Boolean(cooperating || showWorkflow)} providerReady={Boolean(workspaceDirectory) && (agent.provider === 'codex' ? capabilities?.codex.available : capabilities?.harness.available)} models={models[agent.provider] || null} embedded={embedded} input={drafts[key] || ''} onInput={text => setDrafts(old => ({ ...old, [key]: text }))} onSent={text => setDrafts(old => old[key] === text ? { ...old, [key]: '' } : old)} onSend={text => { if (cooperating && agent.id === state.leaderId) { openGoal(text, { key, text: drafts[key] || text }); return Promise.resolve(false); } return action({ action: 'message', agentId: agent.id, text }, agent.id); }} onNew={() => newChat(agent.id)} onCancel={() => stopAgent(agent)} onHistory={() => { setHistoryAgent(agent.id); setDialog('history'); }} onReturn={() => setViews(old => ({ ...old, [agent.id]: undefined }))} onModel={modelId => updateAgent(agent.id, { modelId, reasoningEffort: 'auto' })} onEffort={reasoningEffort => updateAgent(agent.id, { reasoningEffort })} onSettings={() => setDialog('settings')} />;
   };
   const toggleWorkers = () => { if (!visibleWorkers.length) { setDialog('team'); return; } setPanelOpen(open => !open); };
   const openWorkflow = () => setDialog('workflow');
@@ -278,7 +290,7 @@ export default function App() {
     <div className={'split-app ' + (embedded ? 'embedded' : '')}>
       <header className="split-topbar">
         <div className="split-brand">{embedded ? <><ProviderIcon provider={worker?.provider || 'deepseek'} /><span>第二个对话</span></> : <><Command size={17} /><span>异智能体</span></>}</div>
-        {!embedded && <div className="split-project" title={context}><Folder size={13} /><span>{context.split(/[\\/]/).filter(Boolean).at(-1) || '异智能体合作'}</span></div>}
+        <button className="workspace-button" type="button" title={workspaceDirectory || (legacyWorkspace ? '尚未绑定工作目录；备用目录：' + legacyWorkspace : '尚未绑定工作目录')} aria-label={'查看工作目录：' + (workspaceDirectory || '尚未绑定')} onClick={() => setDialog('workspace')}><Folder size={13} /><span className="workspace-button-label">工作目录</span><span className="workspace-button-name">{workspaceDirectory ? workspaceDirectory.split(/[\\/]/).filter(Boolean).at(-1) || workspaceDirectory : '未绑定'}</span></button>
         <div className="split-top-actions">
           <div className="collaboration-toggle" aria-label="合作模式"><button className={!cooperating ? 'selected' : ''} aria-pressed={!cooperating} disabled={anyPending} onClick={() => action({ action: 'collaboration', mode: 'independent' })}>非合作</button><button className={cooperating ? 'selected' : ''} aria-pressed={Boolean(cooperating)} disabled={anyPending} onClick={() => action({ action: 'collaboration', mode: 'cooperative' })}>合作</button></div>
           <button className="team-button" title="管理智能体团队" onClick={() => setDialog('team')}><UsersRound size={15} /><span>{state.agents.length} 个</span>{busyCount > 0 && <small>{busyCount} 运行</small>}</button>
@@ -295,9 +307,14 @@ export default function App() {
         {showWorkers && worker ? <div className="worker-column"><div className="worker-switcher"><label>工作者<select aria-label="选择工作者对话" value={worker.id} onChange={event => setWorkerId(event.target.value)}>{visibleWorkers.map(agent => <option key={agent.id} value={agent.id}>{agent.name + (agentBusy(agent, state) ? ' · 运行中' : '')}</option>)}</select></label><button className="icon-button" title="隐藏工作者聊天；后台继续运行" onClick={() => setPanelOpen(false)}><EyeOff size={14} /></button></div>{pane(worker)}</div> : embedded ? <div className="panel-closed"><p>工作者聊天已隐藏，后台运行状态保持不变。</p><button className="button secondary" onClick={() => visibleWorkers.length ? setPanelOpen(true) : setDialog('team')}>显示工作者</button><button className="button secondary" onClick={() => setDialog('team')}>管理团队与停止任务</button></div> : null}
       </main>
       {dialog && dialog !== 'goal' && <div className="modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setDialog(null); }}><section className={'modal ' + (dialog === 'team' ? 'wide' : '')} role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-        <div className="modal-heading"><h2 id="dialog-title">{dialog === 'settings' ? '设置' : dialog === 'history' ? (historyOwner?.name || '智能体') + ' 的对话' : dialog === 'team' ? '智能体团队' : '恢复与进度'}</h2><button className="icon-button" title="关闭" onClick={() => setDialog(null)}><X size={18} /></button></div>
+        <div className="modal-heading"><h2 id="dialog-title">{dialog === 'settings' ? '设置' : dialog === 'workspace' ? '工作目录' : dialog === 'history' ? (historyOwner?.name || '智能体') + ' 的对话' : dialog === 'team' ? '智能体团队' : '恢复与进度'}</h2><button className="icon-button" title="关闭" onClick={() => setDialog(null)}><X size={18} /></button></div>
         <div className="modal-content">
           {error && <div className="error-note" role="alert"><span>{error}</span></div>}
+          {dialog === 'workspace' && <>
+            <div className="workspace-details"><div className="workspace-details-heading"><Folder size={17} /><strong>{workspaceDirectory ? '当前协作使用此目录' : '这份协作状态尚未绑定目录'}</strong></div>{workspacePath ? <><label className="workspace-path-label">{workspaceDirectory ? '完整路径' : '备用目录 · 尚未绑定'}<textarea className="workspace-path" aria-label={workspaceDirectory ? '工作目录完整路径' : '未绑定的备用目录路径'} readOnly rows={3} value={workspacePath} onFocus={event => event.currentTarget.select()} /></label><div className="workspace-copy-row"><button className="button secondary" type="button" onClick={copyWorkspace}>{workspaceCopyState === 'copied' ? <Check size={13} /> : <Copy size={13} />}{workspaceCopyState === 'copied' ? '已复制' : workspaceDirectory ? '复制路径' : '复制备用路径'}</button><small role="status">{workspaceCopyState === 'failed' ? '无法自动复制，可选中上方路径后复制。' : workspaceCopyState === 'copied' ? '完整路径已复制。' : '点击路径可选中全文。'}</small></div></> : <p className="context-note">连接服务后可查看目录。</p>}</div>
+            <p className="context-note">{workspaceDirectory ? '目录由后台固定，切换原生项目不会改变它。这份协作状态与此目录一起保存。' : '已有任务尚未记录原来的工作目录，暂时不能在备用目录继续。请先处理服务给出的目录提示。'}</p>
+            <p className="context-note">要处理另一个项目，需要为它独立保存一份协作状态。</p>
+          </>}
           {dialog === 'team' && <>
             <div className="team-toolbar"><span>{state.agents.length}/8 个智能体 · {busyCount} 个运行中 · {executionLabel(state)}</span>{(busyCount > 0 || state.phase === 'running') && <button className="button secondary" disabled={bulkBusy} onClick={stopAllActive}><Square size={12} />停止全部</button>}<button className="button secondary" disabled={bulkBusy} onClick={() => setAllHidden(visibleWorkers.length > 0)}>{visibleWorkers.length > 0 ? <EyeOff size={14} /> : <Eye size={14} />}{visibleWorkers.length > 0 ? '隐藏全部工作者' : '显示全部工作者'}</button><button className="button primary" disabled={state.agents.length >= 8 || bulkBusy} onClick={() => setAdding(value => !value)}><Plus size={14} />新增智能体</button></div>
             <p className="context-note">显示或隐藏只改变聊天界面。只读分析可以并行；修改文件时独占工作目录，不能与其他执行同时运行。规划与核查固定只读，当前监工始终可见。</p>
@@ -312,7 +329,7 @@ export default function App() {
             <p className="context-note">检测读取本地配置和运行时文件，不启动模型任务。未验证的载体不代表工具执行已通过；修复后可在这里重新检测。</p>
             <div className="detail-note"><strong>保留 Codex 原有界面</strong><p>项目栏、标签页、预览、定时任务和新建任务继续由 Codex 宿主提供。插件后台监工独立运行；原生主聊天也可以直接委托工作者，收到结果后核查并继续派单。</p><p>{nativeHost ? '从原生菜单打开「异智能体」侧面板，即可同时查看主聊天和工作者对话。' : '当前为浏览器备用预览；原生入口由本地插件提供。'}</p>{!nativeHost && <a href="http://127.0.0.1:4318/?embed=deepseek" target="_blank" rel="noreferrer">浏览器备用预览 <ExternalLink size={12} /></a>}</div>
             <div className="settings-actions"><button className="button secondary" onClick={() => setDialog('team')}>管理团队</button><button className="button secondary" onClick={openWorkflow}>协作设置</button></div>
-            {context && <p className="context-note" title={context}>工作目录：{context}</p>}
+            <div className="setting-row workspace-setting"><div><strong>工作目录</strong><p className="workspace-setting-path" title={workspacePath}>{workspaceDirectory || (legacyWorkspace ? '尚未绑定 · 备用目录：' + legacyWorkspace : '尚未绑定')}</p><span>目录由后台固定；另一个项目需要独立保存的协作状态。</span></div><button className="button secondary" type="button" onClick={() => setDialog('workspace')}><Folder size={13} />查看目录</button></div>
           </>}
           {dialog === 'history' && <>
             <button className="session-row current" onClick={() => { setViews(old => ({ ...old, [historyAgent]: undefined })); setDialog(null); }}><span>当前对话</span><Check size={15} /></button>
@@ -345,7 +362,7 @@ export default function App() {
           </>}
         </div>
       </section></div>}
-      <GoalBriefEditor open={dialog === 'goal'} state={state} leader={leader} workspace={context} pending={anyPending} requestError={error} seed={goalSeed} onClose={() => setDialog(null)} onSave={async (brief: GoalBriefFields, expectedRevision) => { const result = await actionResult({ action: 'saveGoalBrief', brief, expectedRevision }, 'goal'); return result?.goalDraft || null; }} onConfirm={async (revision, expectedMode, expectedLeaderId, expectedLeaderConfig) => { const source = goalSource.current; const result = await actionResult({ action: 'confirmGoalBrief', revision, expectedMode, expectedLeaderId, expectedLeaderConfig }, 'goal'); if (!result) return false; setShowWorkflow(true); if (source && goalSource.current === source) { setDrafts(old => old[source.key] === source.text ? { ...old, [source.key]: '' } : old); goalSource.current = undefined; } return true; }} onReload={async () => { setError(''); try { const result = await requestJson<State>('/api/state'); acceptState(result); return result.goalDraft; } catch (err) { setError(err instanceof Error ? err.message : '无法重新载入保存版'); return null; } }} />
+      <GoalBriefEditor open={dialog === 'goal'} state={state} leader={leader} workspace={workspaceDirectory} pending={anyPending} requestError={error} seed={goalSeed} onClose={() => setDialog(null)} onSave={async (brief: GoalBriefFields, expectedRevision) => { const result = await actionResult({ action: 'saveGoalBrief', brief, expectedRevision }, 'goal'); return result?.goalDraft || null; }} onConfirm={async (revision, expectedMode, expectedLeaderId, expectedLeaderConfig) => { const source = goalSource.current; const result = await actionResult({ action: 'confirmGoalBrief', revision, expectedMode, expectedLeaderId, expectedLeaderConfig }, 'goal'); if (!result) return false; setShowWorkflow(true); if (source && goalSource.current === source) { setDrafts(old => old[source.key] === source.text ? { ...old, [source.key]: '' } : old); goalSource.current = undefined; } return true; }} onReload={async () => { setError(''); try { const result = await requestJson<State>('/api/state'); acceptState(result); return result.goalDraft; } catch (err) { setError(err instanceof Error ? err.message : '无法重新载入保存版'); return null; } }} />
     </div>
   </div>;
 }
@@ -423,7 +440,8 @@ function ChatPane({ agent, state, selectedConversation, connected, pending, show
   const isLeader = agent.id === state.leaderId;
   const preparingBrief = state.collaborationMode === 'cooperative' && isLeader;
   const running = agentBusy(agent, state) || state.collaborationMode === 'cooperative' && isLeader && state.phase === 'running';
-  const ready = state.mode === 'demo' || Boolean(providerReady);
+  const workspaceBound = Boolean(state.workspaceBinding?.directory);
+  const ready = workspaceBound && (state.mode === 'demo' || Boolean(providerReady));
   const locked = configLocked(agent, state);
   useEffect(() => { if (follow.current) scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); }, [state.revision, currentId]);
   useEffect(() => { follow.current = true; scroll.current?.scrollTo({ top: scroll.current.scrollHeight }); }, [currentId]);
@@ -434,7 +452,7 @@ function ChatPane({ agent, state, selectedConversation, connected, pending, show
       {messages.length ? messages.map(message => <ChatMessage key={message.id} message={message} name={agent.name} />) : <div className="chat-empty"><div className="chat-empty-icon"><ProviderIcon provider={agent.provider} /></div><h1>和 {agent.name} 开始对话</h1><p>{embedded ? '宿主对话保持原样，这里是选中的工作者。' : '选择模型与思考程度，直接提问或提交任务。'}</p></div>}
     </div>
     {session?.lastError && !archived && <div className="error-note" role="alert">{session.lastError}</div>}
-    {archived ? <div className="history-notice"><span>正在查看历史对话</span><button className="button secondary" onClick={onReturn}>返回当前对话</button></div> : <div className="chat-composer"><div className="chat-input-wrap"><textarea className="chat-input" aria-label={'发送给 ' + agent.name} placeholder={preparingBrief ? '写下想法，按 Enter 整理任务委托书（不会执行）…' : '发消息给 ' + agent.name + '…'} value={input} disabled={!connected || !ready} onChange={event => onInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} /><div className="composer-footer"><span className="composer-note">{preparingBrief && !running ? 'Enter 整理目标 · 确认后执行' : state.mode === 'demo' ? '演示模式 · 不消耗额度' : !ready ? '尚未连接模型' : running ? '正在处理 · 可停止或预写下一条消息' : 'Enter 发送 · Shift + Enter 换行'}</span>{running ? <button className="stop-button" title={'停止 ' + agent.name + ' 当前工作'} disabled={pending} onClick={onCancel}><Square size={14} fill="currentColor" /></button> : <button className="send-button" title={preparingBrief ? '整理任务目标' : '发送给 ' + agent.name} disabled={pending || !input.trim() || !connected || !ready} onClick={send}>{pending ? <Loader2 size={16} className="spin" /> : <ArrowUp size={18} />}</button>}</div></div>{state.mode === 'live' && !ready && <button className="connect-prompt" onClick={onSettings}>配置 {providerName(agent.provider)} 连接</button>}</div>}
+    {archived ? <div className="history-notice"><span>正在查看历史对话</span><button className="button secondary" onClick={onReturn}>返回当前对话</button></div> : <div className="chat-composer"><div className="chat-input-wrap"><textarea className="chat-input" aria-label={'发送给 ' + agent.name} placeholder={preparingBrief ? '写下想法，按 Enter 整理任务委托书（不会执行）…' : '发消息给 ' + agent.name + '…'} value={input} disabled={!connected || !ready} onChange={event => onInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} /><div className="composer-footer"><span className="composer-note">{!workspaceBound ? '工作目录尚未绑定' : preparingBrief && !running ? 'Enter 整理目标 · 确认后执行' : state.mode === 'demo' ? '演示模式 · 不消耗额度' : !ready ? '尚未连接模型' : running ? '正在处理 · 可停止或预写下一条消息' : 'Enter 发送 · Shift + Enter 换行'}</span>{running ? <button className="stop-button" title={'停止 ' + agent.name + ' 当前工作'} disabled={pending} onClick={onCancel}><Square size={14} fill="currentColor" /></button> : <button className="send-button" title={preparingBrief ? '整理任务目标' : '发送给 ' + agent.name} disabled={pending || !input.trim() || !connected || !ready} onClick={send}>{pending ? <Loader2 size={16} className="spin" /> : <ArrowUp size={18} />}</button>}</div></div>{(!workspaceBound || state.mode === 'live' && !ready) && <button className="connect-prompt" onClick={onSettings}>{workspaceBound ? '配置 ' + providerName(agent.provider) + ' 连接' : '查看工作目录'}</button>}</div>}
   </section>;
 }
 function ChatMessage({ message, name }: { message: Message; name: string }) {

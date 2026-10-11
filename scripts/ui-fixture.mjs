@@ -48,7 +48,7 @@ if (recoveryScene === 'role-budget') {
   ];
   initialState.messages = [];
 }
-const engine = new Orchestrator({providers:fixtureProviders,demoDelayMs:1000,workspace:'C:/Projects/hetero-agent-demo',initialState});
+const engine = new Orchestrator({providers:fixtureProviders,demoDelayMs:1000,workspace:process.env.RELAY_FIXTURE_WORKSPACE || process.cwd(),initialState});
 if (reviewErrors) {
   const originalReview = engine._demoReview.bind(engine);
   let remaining = reviewErrors;
