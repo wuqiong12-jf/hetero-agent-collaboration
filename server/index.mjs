@@ -53,13 +53,13 @@ export function createAppServer({ engine, workspace = process.env.RELAY_WORKSPAC
         sendJson(response, { error: '这个来源不能访问本地协作服务' }, 403); return;
       }
       if (request.method === 'GET' && url.pathname === '/api/state') { sendJson(response, orchestrator.getState()); return; }
-      if (request.method === 'GET' && url.pathname === '/api/capabilities') { sendJson(response, await orchestrator.getCapabilities()); return; }
+      if (request.method === 'GET' && url.pathname === '/api/capabilities') { sendJson(response, await orchestrator.getCapabilities({ refresh: true })); return; }
       if (request.method === 'GET' && url.pathname === '/api/models') {
         const provider = url.searchParams.get('provider') || 'codex';
         if (!['codex', 'deepseek'].includes(provider)) throw new ActionError('模型提供商无效');
         sendJson(response, await modelCatalogProvider.getModels({ provider })); return;
       }
-      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.6.0' }); return; }
+      if (request.method === 'GET' && url.pathname === '/api/context') { sendJson(response, { service: 'relay-agent-workbench', protocolVersion: 1, workspace: orchestrator.workspace, version: '0.6.1' }); return; }
       if (request.method === 'GET' && url.pathname === '/api/events') {
         response.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform',

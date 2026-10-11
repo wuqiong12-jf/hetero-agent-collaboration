@@ -10,9 +10,18 @@ const catalog = provider => ({
     supportedReasoningEfforts: (provider === 'codex' ? ['low', 'medium', 'high'] : ['off', 'low', 'high', 'max']).map(reasoningEffort => ({ reasoningEffort })),
   }],
 });
+const runtimeScene = process.env.RELAY_FIXTURE_RUNTIME || '';
+if (runtimeScene && runtimeScene !== 'blocked-then-unverified') throw new Error('Invalid fixture runtime scene');
+let runtimeChecks = 0;
 const fixtureProviders = {
   getModels: async ({ provider }) => catalog(provider),
-  getCapabilities: async () => ({codex:{available:false,detail:'界面验收用演示环境'},harness:{available:false,detail:'界面验收用演示环境'},liveReady:false}),
+  getCapabilities: async () => {
+    if (!runtimeScene) return {codex:{available:false,detail:'界面验收用演示环境'},harness:{available:false,detail:'界面验收用演示环境'},liveReady:false};
+    const blocked = ++runtimeChecks === 1;
+    return {codex:{available:true,detail:'【隔离界面验收】模拟登录状态，没有真实模型。'},harness:{available:!blocked,
+      runtimeCheck:blocked?'blocked':'unverified',runtimeIssue:blocked?'windows-acl-entry-missing':null,
+      detail:blocked?'【隔离演示】当前 Windows Harness 运行时的沙箱命令入口缺失，暂不可执行。已有对话和交付保留。':'【隔离演示】替换后的载体未做命令功能验证，连接及工具执行仍需实际核验。'},liveReady:!blocked};
+  },
   runAgent: async () => { throw new Error('UI fixture cannot invoke models'); },
 };
 const reviewErrors = Number(process.env.RELAY_FIXTURE_REVIEW_ERRORS || 0);
@@ -21,6 +30,7 @@ const recoveryScene = process.env.RELAY_FIXTURE_RECOVERY || '';
 if (recoveryScene && recoveryScene !== 'role-budget') throw new Error('Invalid fixture recovery scene');
 if (recoveryScene && reviewErrors) throw new Error('Recovery and review error scenes cannot be combined');
 const initialState = createInitialState();
+if (runtimeScene) {initialState.mode='live';initialState.phase='paused';initialState.tasks=[];initialState.goal='【隔离界面验收】连接检查，不执行模型任务。';initialState.messages=[];}
 if (reviewErrors) {
   initialState.collaborationMode = 'cooperative';
   initialState.goal = '【演示】核查回复无效时，保留同一交付并只重新核查。';

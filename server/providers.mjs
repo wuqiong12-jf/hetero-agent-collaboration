@@ -396,11 +396,20 @@ export function createProviders(options = {}) {
         killTree(child);
         const hasKey = Boolean(env.DEEPSEEK_API_KEY?.trim());
         const sdk = details.sdk === true && details.runtime === true;
-        resolveProbe({ available: sdk && hasKey, sdkInstalled: sdk, keyConfigured: hasKey, reasoningEffortSupported: sdk && details.reasoningEffortSupported === true,
+        const executionReady = details.executionReady !== false;
+        const runtimeCheck = ['blocked', 'unverified', 'not-applicable', 'failed'].includes(details.runtimeCheck) ? details.runtimeCheck : 'unverified';
+        const runtimeIssue = ['windows-acl-entry-missing', 'runtime-check-failed'].includes(details.runtimeIssue) ? details.runtimeIssue : null;
+        resolveProbe({ available: sdk && hasKey && executionReady, sdkInstalled: sdk, keyConfigured: hasKey, runtimeCheck, runtimeIssue,
+          reasoningEffortSupported: sdk && details.reasoningEffortSupported === true,
           reasoningEfforts: sdk && Array.isArray(details.reasoningEfforts) ? details.reasoningEfforts.filter(effort => ['off', 'low', 'high', 'max'].includes(effort)) : [],
           ...(typeof details.sdkVersion === 'string' ? { sdkVersion: details.sdkVersion } : {}),
           ...(typeof details.runtimeVersion === 'string' ? { runtimeVersion: details.runtimeVersion } : {}),
-          model: env.RELAY_DEEPSEEK_MODEL || 'deepseek-flash', detail: !sdk ? `Harness SDK 尚未就绪：${details.detail || '在 RELAY_PYTHON 对应环境安装 deepseek-harness-sdk。'}` : !hasKey ? 'Harness SDK 已安装，缺少 DEEPSEEK_API_KEY。' : 'Harness SDK 与凭证已配置；连接在执行时验证，使用 workspace-write，拒绝权限升级。' });
+          model: env.RELAY_DEEPSEEK_MODEL || 'deepseek-flash', detail: !sdk ? `Harness SDK 尚未就绪：${cleanError(details.detail || '在 RELAY_PYTHON 对应环境安装 deepseek-harness-sdk。', env)}`
+            : !executionReady ? runtimeIssue === 'windows-acl-entry-missing' ? '已检测到当前 Windows Harness 运行时的沙箱命令入口缺失，暂不可执行。请安装包含此修复的匹配 SDK 与运行时；现有对话和交付保留。'
+              : 'Harness 运行时检查失败，尚不能确认可执行。请检查安装和文件权限后重试。'
+            : !hasKey ? 'Harness SDK 已安装，缺少 DEEPSEEK_API_KEY。'
+            : runtimeCheck === 'unverified' ? 'Harness SDK 与凭证已配置；运行时未做命令功能验证，连接及工具执行仍需实际核验。沿用受限执行策略。'
+              : 'Harness SDK 与凭证已配置；连接在执行时验证，沿用受限执行策略。' });
       };
       const timer = setTimeout(() => finish({ detail: 'Python/SDK 检测超时。' }), probeTimeoutMs);
       try {

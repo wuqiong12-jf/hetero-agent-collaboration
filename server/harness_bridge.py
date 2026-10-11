@@ -14,6 +14,8 @@ import threading
 import uuid
 from pathlib import Path
 
+from harness_runtime import inspect_runtime
+
 
 def emit(value: dict) -> None:
     print(json.dumps(value, ensure_ascii=False), flush=True)
@@ -34,7 +36,11 @@ def probe() -> None:
         from deepseek_harness import DeepSeekHarness  # noqa: F401
         from deepseek_harness_runtime import resolve_bundled_launch_args
 
-        launch = resolve_bundled_launch_args()
+        try:
+            launch = resolve_bundled_launch_args()
+        except (OSError, ValueError):
+            launch = ()
+        inspection = inspect_runtime(launch)
         ready = bool(launch and Path(launch[0]).is_file())
         config_fields = getattr(getattr(sdk, "DeepSeekHarnessConfig", None), "__dataclass_fields__", {})
         supports_effort = "reasoning_effort" in config_fields
@@ -49,9 +55,11 @@ def probe() -> None:
               "reasoningEffortSupported": supports_effort,
               "reasoningEfforts": ["off", "low", "high", "max"] if supports_effort else [],
               **versions,
-              "detail": "" if ready else "Matching native runtime is unavailable."})
+              **inspection})
     except Exception as exc:
         emit({"type": "capabilities", "sdk": False, "runtime": False,
+              "runtimeCheck": "failed", "executionReady": False,
+              "runtimeIssue": "runtime-check-failed",
               "detail": scrub(exc)})
 
 
@@ -118,6 +126,15 @@ def run(payload: dict) -> None:
         raise RuntimeError("DEEPSEEK_API_KEY is required.")
     import deepseek_harness as sdk
     from deepseek_harness import DeepSeekHarness
+    from deepseek_harness_runtime import resolve_bundled_launch_args
+
+    try:
+        launch = resolve_bundled_launch_args()
+    except (OSError, ValueError):
+        launch = ()
+    inspection = inspect_runtime(launch)
+    if not inspection["executionReady"]:
+        raise RuntimeError(inspection["detail"])
 
     reasoning_effort = payload.get("reasoningEffort")
     if reasoning_effort is not None:

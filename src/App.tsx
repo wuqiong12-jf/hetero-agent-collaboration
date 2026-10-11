@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowUp, Check, Command, ExternalLink, Eye, EyeOff, Folder, History, Loader2, MessageSquarePlus, Pause, Play, Plus, Settings2, Square, Trash2, UsersRound, X } from 'lucide-react';
+import { ArrowUp, Check, Command, ExternalLink, Eye, EyeOff, Folder, History, Loader2, MessageSquarePlus, Pause, Play, Plus, RefreshCw, Settings2, Square, Trash2, UsersRound, X } from 'lucide-react';
 import type { Agent, Capabilities, GoalBriefFields, Message, ModelCatalog, Provider, RecoverySettingKey, State, Task } from './types';
 import { nativeHost, requestJson, watchState } from './transport';
 import GoalBriefEditor from './GoalBriefEditor';
@@ -99,6 +99,8 @@ export default function App() {
   const [state, setState] = useState<State | null>(null);
   const stateRef = useRef<State | null>(null);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  const [checkingConnection, setCheckingConnection] = useState(false);
+  const capabilityGeneration = useRef(0);
   const [models, setModels] = useState<Partial<Record<Provider, ModelCatalog>>>({});
   const [embedded, setEmbedded] = useState(initialEmbedded);
   const [panelOpen, setPanelOpen] = useState(true);
@@ -136,13 +138,24 @@ export default function App() {
     const report = (message: string) => { if (!disposed) setError(message); };
     const stopWatching = watchState(accept, value => { if (!disposed) setConnected(value); }, report);
     requestJson<State>('/api/state').then(accept).catch(error => report(error.message));
-    requestJson<Capabilities>('/api/capabilities').then(value => { if (!disposed) setCapabilities(value); }).catch(() => {});
+    const generation = capabilityGeneration.current;
+    requestJson<Capabilities>('/api/capabilities').then(value => { if (!disposed && generation === capabilityGeneration.current) setCapabilities(value); }).catch(() => {});
     for (const provider of ['codex', 'deepseek'] as const) requestJson<ModelCatalog>('/api/models?provider=' + provider).then(value => { if (!disposed) setModels(old => ({ ...old, [provider]: value })); }).catch(() => {});
     requestJson<{ workspace: string }>('/api/context').then(value => { if (!disposed) setContext(value.workspace || ''); }).catch(() => {});
     const view = (event: Event) => { const side = (event as CustomEvent).detail === 'deepseek'; setEmbedded(side); if (side) setPanelOpen(true); };
     window.addEventListener('relay-view', view);
     return () => { disposed = true; stopWatching(); window.removeEventListener('relay-view', view); };
   }, [acceptState]);
+  const refreshConnections = async () => {
+    if (checkingConnection) return;
+    const generation = ++capabilityGeneration.current;
+    setCheckingConnection(true);
+    try {
+      const result = await requestJson<Capabilities>('/api/capabilities');
+      if (generation === capabilityGeneration.current) setCapabilities(result);
+    } catch (error) { setError(error instanceof Error ? error.message : '连接检测未完成，请稍后重试。'); }
+    finally { setCheckingConnection(false); }
+  };
   useEffect(() => {
     const move = (event: PointerEvent) => {
       if (!dragging.current || !panes.current) return;
@@ -295,6 +308,8 @@ export default function App() {
             <div className="setting-row"><div><strong>运行模式</strong><p>演示不调用模型；真实对话使用已配置的渠道。</p></div><select aria-label="运行模式" value={state.mode} disabled={anyPending || state.phase === 'running' || busyCount > 0} onChange={event => action({ action: 'mode', mode: event.target.value })}><option value="demo">演示</option><option value="live" disabled={!capabilities?.codex.available && !capabilities?.harness.available}>真实对话</option></select></div>
             <div className="connection-row"><ProviderIcon provider="codex" /><div><strong>Codex · ChatGPT 登录</strong><p>{capabilities?.codex.detail || '正在检测…'}</p></div></div>
             <div className="connection-row"><ProviderIcon provider="deepseek" /><div><strong>DeepSeek Harness</strong><p>{capabilities?.harness.detail || '正在检测…'}</p></div></div>
+            <button className="button secondary" type="button" disabled={checkingConnection || !connected} onClick={refreshConnections}>{checkingConnection ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />}{checkingConnection ? '正在检测…' : '重新检测连接'}</button>
+            <p className="context-note">检测读取本地配置和运行时文件，不启动模型任务。未验证的载体不代表工具执行已通过；修复后可在这里重新检测。</p>
             <div className="detail-note"><strong>保留 Codex 原有界面</strong><p>项目栏、标签页、预览、定时任务和新建任务继续由 Codex 宿主提供。插件后台监工独立运行；原生主聊天也可以直接委托工作者，收到结果后核查并继续派单。</p><p>{nativeHost ? '从原生菜单打开「异智能体」侧面板，即可同时查看主聊天和工作者对话。' : '当前为浏览器备用预览；原生入口由本地插件提供。'}</p>{!nativeHost && <a href="http://127.0.0.1:4318/?embed=deepseek" target="_blank" rel="noreferrer">浏览器备用预览 <ExternalLink size={12} /></a>}</div>
             <div className="settings-actions"><button className="button secondary" onClick={() => setDialog('team')}>管理团队</button><button className="button secondary" onClick={openWorkflow}>协作设置</button></div>
             {context && <p className="context-note" title={context}>工作目录：{context}</p>}

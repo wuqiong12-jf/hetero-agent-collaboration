@@ -213,6 +213,18 @@ npm start
 
 ## 模型渠道与本地凭证
 
+### Windows Harness 运行时检查（v0.6.1）
+
+已安装 SDK 和运行时均为 0.1.5rc1，当前已确认 Windows EXE 缺 ACL 子入口分发，沙箱子调用会误入普通 CLI 并报缺少 `--profile`。这不是桥接的 SDK profile 漏配。当前 [PyPI 发布页](https://pypi.org/project/deepseek-harness-sdk/0.1.5rc1/)仍将该版本列为最新发布；本轮不更换依赖或减弱执行策略。
+
+`harness_runtime.inspect_runtime()` 仅读取载体，按 SHA256 和字节数同时匹配已证实坏文件；不会按版本号拦截所有构建。命中返回 `blocked`，文件无法读取返回 `failed`，未知 Windows/Node 载体返回 `unverified`，非 Windows 返回 `not-applicable`。这些状态不是工具功能验证或安全认证。探针保留 SDK/文件存在层，并新增执行阻碍层；Python run 在 SDK 构造和 home 创建前重新检查。
+
+Node 能力把明确失败映射为 unavailable；正常聊天、启动/继续及手动返工在相应渠道预检后才推进，失败保留已有消息、输出和调用计数。返工检查实际工作者，Codex 对已有交付的核查不依赖无关 DeepSeek 渠道。读取 `/api/capabilities` 和设置中的重新检测使用刷新检查，并合并在途请求；这些读取不修改任务状态或发起模型推理。
+
+重新检测使用当前后台进程配置，不重新读取 local-config 或解密凭证。更换解释器路径、模型环境配置或凭证文件后，仍需按原更新流程重启后台。
+
+检查到执行之间仍可能更换载体。Python 重检可在识别到坏载体时阻止进入 SDK，但如果替换发生在调度预检之后，调度可能已经记录执行尝试；不能承诺所有文件替换竞态均不扣尝试次数。没有建立运行时文件锁，也没有修复沙箱入口或改成 sdk-minimal。后续须用匹配载体验证 ACL helper 分发及隔离目录中的实际受限命令行为。证据见[本轮记录](runs/2026-10-11-runtime.md)。
+
 本机已下载官方源码到 `.relay/vendor/deepseek-harness`，并在项目独立 `.venv` 中安装 `deepseek-harness-sdk==0.1.5rc1` 和匹配的 Windows 运行时，可用 `requirements-harness.txt` 重建环境。
 
 服务自动读取 `.relay/local-config.json` 中的解释器路径与模型配置，并使用 Windows DPAPI 解密 `.relay/secrets/deepseek.dpapi`。密钥仅在当前用户的服务进程内使用，不包含在源码、前端或 Git 中；已有环境变量优先。换电脑或 Windows 用户后需要重新配置凭证。

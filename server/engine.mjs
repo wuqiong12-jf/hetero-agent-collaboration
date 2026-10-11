@@ -195,7 +195,7 @@ export class Orchestrator {
     return snapshot;
   }
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
-  async getCapabilities() { return this.providers.getCapabilities(); }
+  async getCapabilities(options = {}) { return this.providers.getCapabilities(options); }
 
   action(payload) {
     const operation = this.actionChain.then(() => this._handleAction(payload));
@@ -378,7 +378,7 @@ export class Orchestrator {
         };
         if (!canReview()) return this.getState();
         if (this.state.mode === 'live') {
-          const capabilities = await this.getCapabilities();
+          const capabilities = await this.getCapabilities({ refresh: this._leader()?.provider === 'deepseek' });
           // Check only the monitor's channel; retained output needs no new worker.
           if (!canReview()) return this.getState();
           const monitor = this._leader();
@@ -393,6 +393,18 @@ export class Orchestrator {
         const task = this._task(payload.taskId);
         if (task.status !== 'rejected') throw new ActionError('只有未通过的任务可以返工', 409);
         if (task.attempt > this.state.settings.maxRetries) throw new ActionError('返工次数已到上限，请调整返工预算后继续', 409);
+        if (this.state.mode === 'live') {
+          const capabilities = await this.getCapabilities({ refresh: true });
+          this._assertOpen();
+          this.providerAvailability = { codex: capabilities.codex?.available === true, deepseek: capabilities.harness?.available === true };
+          const actor = this._taskActor(task);
+          if (!actor) {
+            const assigned = this.state.agents.find(agent => agent.id === task.agentId && agent.id !== this.state.leaderId);
+            const capability = assigned?.provider === 'codex' ? capabilities.codex : capabilities.harness;
+            throw new ActionError(capability?.detail || '当前返工工作者渠道尚未就绪，已有交付和次数保留', 409);
+          }
+          if (this._workspaceChatBusy()) throw new ActionError('普通聊天仍在生成；请等待完成或停止后再返工', 409);
+        }
         task.status = 'queued'; task.criteria.forEach((item) => item.status = 'pending');
         this.state.phase = 'running'; delete this.state.error; this.forceDispatch = true;
         this._activity('retry', `手动返工：${task.title}`, task.id); this._emit(); this._queuePump(); break;
@@ -418,7 +430,7 @@ export class Orchestrator {
         if ([...this.runs.values()].some((run) => run.kind === 'chat' && run.agentId === agent.id)) throw new ActionError('这一侧正在生成回复，请先停止或等待完成', 409);
         if (this.state.mode === 'live' && this._agentBusy(agent.id)) throw new ActionError('这个智能体正在执行任务，请稍后发送消息', 409);
         if (this.state.mode === 'live') {
-          const capabilities = await this.getCapabilities();
+          const capabilities = await this.getCapabilities({ refresh: agent.provider === 'deepseek' });
           this._assertOpen();
           this._assertMessageExpectation(payload);
           const capability = agent.provider === 'codex' ? capabilities.codex : capabilities.harness;
@@ -656,7 +668,7 @@ export class Orchestrator {
     return next;
   }
   async _requireTeamCapabilities({ planning = !this.state.tasks.length } = {}) {
-    const capabilities = await this.getCapabilities();
+    const capabilities = await this.getCapabilities({ refresh: true });
     this._assertOpen();
     this.providerAvailability = { codex: capabilities.codex?.available === true, deepseek: capabilities.harness?.available === true };
     const participants = [this._leader(), ...(planning ? [] : this.state.tasks.filter((task) => !['accepted', 'cancelled'].includes(task.status)).map((task) => this.state.agents.find((agent) => agent.id === task.agentId)))];
